@@ -16,6 +16,9 @@ import re
 import time
 import zlib
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
 
 import httpx
@@ -47,6 +50,11 @@ _THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,39}$")
 # One page of text is a few kilobytes; anything near this is not an answer.
 _MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# "37s" or "37.5s": how the API says when a rate limit lets requests in again.
+_RETRY_DELAY = re.compile(r"^([0-9]{1,6}(?:\.[0-9]{1,9})?)s$")
+_RETRY_HEADER = re.compile(r"^[0-9]{1,6}$")
+# A longer wait than this is not a per-minute limit; the page is given up.
+_MAX_RETRY_AFTER = 120.0
 
 
 def _code(value: object) -> str:
@@ -56,10 +64,19 @@ def _code(value: object) -> str:
 class GeminiError(Exception):
     """A page could not be read. ``retryable`` says whether trying again can help."""
 
-    def __init__(self, message: str, *, retryable: bool, attempts: int = 1) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        attempts: int = 1,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.attempts = attempts
+        # Seconds the endpoint asked to wait before the next request.
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -160,8 +177,33 @@ def _parse_response(payload: dict) -> PageResult:
     )
 
 
-def _http_error(status_code: int, raw: bytes) -> GeminiError:
+def _retry_after(header: str | None, error: object) -> float | None:
+    """Seconds to wait, from the Retry-After header or the API's RetryInfo."""
+    waits: list[float] = []
+    if header and _RETRY_HEADER.match(header.strip()):
+        waits.append(float(header.strip()))
+    elif header:
+        # The other allowed form: a point in time.
+        try:
+            moment = parsedate_to_datetime(header.strip())
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            waits.append(max(0.0, (moment - datetime.now(timezone.utc)).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    details = error.get("details") if isinstance(error, dict) else None
+    if isinstance(details, list):
+        for detail in details:
+            delay = detail.get("retryDelay") if isinstance(detail, dict) else None
+            match = _RETRY_DELAY.match(delay.strip()) if isinstance(delay, str) else None
+            if match:
+                waits.append(float(match.group(1)))
+    return max(waits) if waits else None
+
+
+def _http_error(status_code: int, raw: bytes, retry_header: str | None = None) -> GeminiError:
     status = ""
+    error = None
     try:
         body = json.loads(raw)
         error = body.get("error") if isinstance(body, dict) else None
@@ -172,6 +214,7 @@ def _http_error(status_code: int, raw: bytes) -> GeminiError:
     return GeminiError(
         f"HTTP {status_code} {status}".strip(),
         retryable=status_code in _RETRY_STATUS,
+        retry_after=_retry_after(retry_header, error),
     )
 
 
@@ -207,8 +250,16 @@ class GeminiClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _post(self, url: str, headers: dict, body: dict, timeout: float) -> tuple[int, bytes]:
+    def _post(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        timeout: float,
+    ) -> tuple[int, bytes, str | None]:
         """Send one request; the whole exchange gets ``timeout`` seconds.
+
+        Returns status, body and the Retry-After header.
 
         httpx applies its timeout to every single read, so an endpoint that
         keeps sending a few bytes would never run into it. The answer is
@@ -250,7 +301,7 @@ class GeminiClient:
                     if size > _MAX_RESPONSE_BYTES:
                         raise GeminiError("answer too large", retryable=False)
                     chunks.append(piece)
-            return response.status_code, b"".join(chunks)
+            return response.status_code, b"".join(chunks), response.headers.get("retry-after")
 
     def transcribe(
         self,
@@ -279,9 +330,9 @@ class GeminiClient:
                     )
                 timeout = min(timeout, remaining)
             try:
-                status_code, raw = self._post(url, headers, body, timeout)
+                status_code, raw, retry_header = self._post(url, headers, body, timeout)
                 if status_code != 200:
-                    raise _http_error(status_code, raw)
+                    raise _http_error(status_code, raw, retry_header)
                 result = parse_response(json.loads(raw))
                 result.attempts = attempt
                 result.seconds = self._clock() - started
@@ -302,8 +353,17 @@ class GeminiClient:
             if not error.retryable or attempt == cfg.max_attempts:
                 break
             delay = min(2.0**attempt + random.uniform(0, 1), 20.0)
-            if deadline is not None:
-                delay = min(delay, max(0.0, deadline - self._clock() - 1))
+            left = None if deadline is None else max(0.0, deadline - self._clock() - 1)
+            if error.retry_after is not None:
+                # A rate limit that says when it lets requests in again.
+                # Asking earlier only uses up the attempts, and the pages of a
+                # document would all come back at the same moment.
+                wait = error.retry_after + random.uniform(0, 3)
+                if error.retry_after > _MAX_RETRY_AFTER or (left is not None and wait > left):
+                    break
+                delay = max(delay, wait)
+            if left is not None:
+                delay = min(delay, left)
             self._sleep(delay)
 
         raise error

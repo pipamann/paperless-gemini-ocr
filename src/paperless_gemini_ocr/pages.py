@@ -228,6 +228,19 @@ def looks_broken(text: str) -> bool:
     return bad / len(text) > 0.1
 
 
+# Words of three letters or more from which local OCR output counts as text.
+# Specks, punch holes and scanner streaks give a few stray characters at most.
+_TEXT_WORDS = 3
+_WORD = re.compile(r"[^\W\d_]{3,}")
+
+
+def reads_like_text(text: str | None) -> bool:
+    """Whether OCR output is more than the noise an empty page produces."""
+    if not text:
+        return False
+    return sum(1 for _ in _WORD.finditer(text)) >= _TEXT_WORDS
+
+
 def pdf_page_texts(path: Path) -> list[str] | None:
     """Embedded text of every page via one pdftotext run, or None on failure.
 
@@ -549,6 +562,10 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
                         stream_decode_level=pikepdf.StreamDecodeLevel.none,
                     )
                     single.close()
+                    if target.stat().st_size > MAX_INLINE_BYTES:
+                        # Too large to send; no use keeping the copy around.
+                        _discard(target)
+                        raise AnalysisError("page too large to upload as PDF")
                     page.payload = target
                     page.mime_type = "application/pdf"
                 except Exception as e:
@@ -748,6 +765,13 @@ def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
 # ---------------------------------------------------------------------------
 
 
+def _discard(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def load_payload(
     page: Page,
     cfg: Config,
@@ -757,6 +781,9 @@ def load_payload(
     """Bytes and MIME type to send for a page. Safe to call from worker threads.
 
     ``deadline`` is a ``time.monotonic()`` value; rendering never runs past it.
+    The copy or rendering of a PDF page is deleted once it is read, so a long
+    document does not sit in the temporary folder a second time while the
+    model works. Image files stay: local OCR may need them for a failed page.
     """
     is_pdf_page = page.source_pdf is not None
     use_file = (
@@ -765,7 +792,10 @@ def load_payload(
         and not (is_pdf_page and cfg.page_input == "image")
     )
     if use_file:
-        return page.payload.read_bytes(), page.mime_type or "application/octet-stream"
+        data = page.payload.read_bytes()
+        if is_pdf_page:
+            _discard(page.payload)
+        return data, page.mime_type or "application/octet-stream"
     if not is_pdf_page:
         raise AnalysisError("page too large to upload")
     dpi = cfg.render_dpi
@@ -782,7 +812,10 @@ def load_payload(
             workdir,
             timeout,
         )
-        if rendered.stat().st_size <= MAX_INLINE_BYTES:
-            return rendered.read_bytes(), "image/jpeg"
+        fits = rendered.stat().st_size <= MAX_INLINE_BYTES
+        data = rendered.read_bytes() if fits else b""
+        _discard(rendered)
+        if fits:
+            return data, "image/jpeg"
         dpi = max(72, dpi * 2 // 3)
     raise AnalysisError("page too large to upload")

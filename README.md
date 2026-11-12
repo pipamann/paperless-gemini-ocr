@@ -27,8 +27,15 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
   text: the document stays as it was and Paperless logs the error.
 - Pages the model reports as upside down are turned upright in the archive
   PDF. The original file is never modified.
-- A page the model calls empty although its own text layer has text counts as
-  failed, so a scanner's text is not thrown away on the model's word.
+- A page the model calls empty is not taken on its word. If the page has a
+  text layer of its own, or Tesseract finds text on it (three words or
+  more), the page counts as failed: it keeps that text and the document is
+  tagged. The same holds when Tesseract could not look at the page. A page
+  that really is empty costs one Tesseract run and is imported empty, without
+  a tag. With `PAPERLESS_OCR_MODE=off` there is nothing to check against.
+- A rate limit that says how long to wait (HTTP 429 with a retry delay) is
+  waited out, up to two minutes and never past the document's time limit,
+  instead of using up the attempts within seconds.
 
 Archive PDF, thumbnail, page count and metadata come from the built-in
 Tesseract parser, which this plugin extends.

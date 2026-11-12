@@ -163,6 +163,12 @@ class StubTesseractParser:
     configured_rotate: bool = True
     configured_user_args: dict | None = None
     parsed: list[tuple[str, str]] = []
+    # What a forced OCR run "reads"; None keeps the built-in stand-in texts.
+    force_text: str | None = None
+    # PAPERLESS_OCR_PAGES: OCR only the first pages of a file.
+    configured_pages: int | None = None
+    # Page widths of every PDF a forced OCR run was given, to tell pages apart.
+    forced_widths: list[list[int]] = []
 
     def __init__(self) -> None:
         self.tempdir = Path(tempfile.mkdtemp(prefix="stub-parser-"))
@@ -170,6 +176,7 @@ class StubTesseractParser:
             mode=type(self).configured_mode,
             rotate=type(self).configured_rotate,
             user_args=type(self).configured_user_args,
+            pages=type(self).configured_pages,
         )
         self.text: str | None = None
         self.archive_path: Path | None = None
@@ -197,6 +204,8 @@ class StubTesseractParser:
         self.text = f"local text ({mode})"
         if mode == _ModeChoices.FORCE and Path(document_path).name.startswith("frame-"):
             self.text = f"tesseract text of {Path(document_path).name}"
+        if mode == _ModeChoices.FORCE and type(self).force_text is not None:
+            self.text = type(self).force_text
         internal = self.tempdir / "archive.pdf"
         if mode == _ModeChoices.FORCE:
             # OCR ran: an output PDF with a recognised text layer per page.
@@ -204,9 +213,15 @@ class StubTesseractParser:
             if mime_type == "application/pdf":
                 with pikepdf.open(document_path) as source:
                     count = len(source.pages)
+                    type(self).forced_widths.append(
+                        [int(page.mediabox[2]) for page in source.pages],
+                    )
             pdf = pikepdf.Pdf.new()
             for index in range(count):
-                add_page(pdf, "scan_text", f"tesseract text of page {index + 1} in this file")
+                layer = type(self).force_text
+                if layer is None:
+                    layer = f"tesseract text of page {index + 1} in this file"
+                add_page(pdf, "scan_text", layer)
             pdf.save(internal)
         elif produce_archive:
             if mime_type == "application/pdf":
@@ -253,6 +268,9 @@ def stub_parser():
     StubTesseractParser.configured_rotate = True
     StubTesseractParser.configured_user_args = None
     StubTesseractParser.parsed = []
+    StubTesseractParser.force_text = None
+    StubTesseractParser.configured_pages = None
+    StubTesseractParser.forced_widths = []
     return StubTesseractParser
 
 

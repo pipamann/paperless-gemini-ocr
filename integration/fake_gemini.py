@@ -1,6 +1,6 @@
 """Stand-in for the Gemini API, steerable over HTTP.
 
-GET /control?mode=ok|fail|flaky|empty|blank|garbage&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
+GET /control?mode=ok|fail|flaky|empty|blank|garbage|ratelimit&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
     sets the behaviour and resets the counters.
 GET /stats returns what was requested since.
 """
@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 LOCK = threading.Lock()
 STATE = {"mode": "ok", "delay": 0.0, "rotation": 0, "fail_first": 0, "label": ""}
-STATS = {"requests": 0, "mimes": [], "max_parallel": 0, "active": 0, "key_seen": False}
+STATS = {"requests": 0, "mimes": [], "times": [], "max_parallel": 0, "active": 0, "key_seen": False}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
                     fail_first=int(query.get("fail_first", ["0"])[0]),
                     label=query.get("label", [""])[0],
                 )
-                STATS.update(requests=0, mimes=[], max_parallel=0, key_seen=False)
+                STATS.update(requests=0, mimes=[], times=[], max_parallel=0, key_seen=False)
                 self._json(200, dict(STATE))
             return
         if url.path == "/stats":
@@ -63,6 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS["requests"] += 1
             number = STATS["requests"]
             STATS["mimes"].append(part["mime_type"])
+            STATS["times"].append(time.monotonic())
             STATS["active"] += 1
             STATS["max_parallel"] = max(STATS["max_parallel"], STATS["active"])
             STATS["key_seen"] = STATS["key_seen"] or bool(self.headers.get("x-goog-api-key"))
@@ -73,6 +74,23 @@ class Handler(BaseHTTPRequestHandler):
                 state["mode"] == "flaky" and number <= state["fail_first"]
             ):
                 self._json(503, {"error": {"status": "UNAVAILABLE"}})
+            elif state["mode"] == "ratelimit" and number <= state["fail_first"]:
+                # A rate limit that says when to come back, as the API does.
+                self._json(
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "6s",
+                                },
+                            ],
+                        },
+                    },
+                )
             elif state["mode"] == "empty":
                 self._json(200, {"candidates": []})
             elif state["mode"] == "garbage":

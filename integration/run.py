@@ -392,6 +392,27 @@ def functional() -> None:
     check("blank answer, scanner layer: text kept", "Musterfirma" in doc["content"], doc["content"][:200])
     check("blank answer, scanner layer: flagged", review_tag_id() in doc["tags"], doc["tags"])
 
+    # ... and not for a plain scan on which local OCR does find text
+    control(mode="blank")
+    doc = document(consume("blank-claim", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    check("blank answer, text on the page: local OCR text", "Musterfirma" in doc["content"], doc["content"][:200])
+    check("blank answer, text on the page: flagged", review_tag_id() in doc["tags"], doc["tags"])
+
+    # In a PDF only the page with text counts as failed, the empty one stays empty.
+    control(mode="blank")
+    doc = document(consume("blank-claim-pdf", "pdf", scan_pdf([page_image([]), page_image(letter(uid()))]))["id"])
+    doc_notes = notes(doc["id"])
+    check("blank answer, pdf: text of the page with text", "Musterfirma" in doc["content"], doc["content"][:200])
+    check("blank answer, pdf: note names that page only", any("page(s) 2 of 2" in n for n in doc_notes), doc_notes)
+
+    # --- a rate limit that says how long to wait is waited out
+    control(mode="ratelimit", fail_first=1)
+    doc = document(consume("rate-limit", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    seen = stats()
+    check("rate limit: read on the second attempt", doc["content"].startswith("FAKE-OCR request 2"), doc["content"][:80])
+    check("rate limit: waited as long as asked", len(seen["times"]) == 2 and seen["times"][1] - seen["times"][0] >= 6, seen["times"])
+    check("rate limit: not flagged", review_tag_id() not in doc["tags"], doc["tags"])
+
     # --- error answers of another shape are retried like any other failure
     control(mode="garbage")
     doc = document(consume("garbage", "jpg", jpeg(page_image(letter(uid()))))["id"])

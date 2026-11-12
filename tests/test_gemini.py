@@ -51,8 +51,12 @@ def client_for(responses: list, cfg: Config = CFG):
         item = queue.pop(0)
         if isinstance(item, Exception):
             raise item
-        status, payload = item
-        return httpx.Response(status, stream=Body(json.dumps(payload).encode()))
+        status, payload, *rest = item
+        return httpx.Response(
+            status,
+            headers=rest[0] if rest else None,
+            stream=Body(json.dumps(payload).encode()),
+        )
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
     return GeminiClient(cfg, http, sleep=sleeps.append), requests, sleeps
@@ -332,3 +336,85 @@ def test_request_time_counts_even_when_nothing_can_be_unpacked_yet():
     with pytest.raises(GeminiError, match="no answer within 30 s"):
         client.transcribe(b"data", "image/jpeg", "prompt")
     assert now[0] <= 50.0
+
+
+RATE_LIMITED = {
+    "error": {
+        "code": 429,
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure"},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"},
+        ],
+    },
+}
+
+
+def test_rate_limit_waits_as_long_as_the_api_asks():
+    """Coming back after two seconds would only use up the attempts."""
+    client, requests, sleeps = client_for([(429, RATE_LIMITED), (200, answer("ROTATION: 0\nok"))])
+    result = client.transcribe(b"data", "image/jpeg", "prompt")
+    assert result.text == "ok"
+    assert len(requests) == 2
+    assert 37 <= sleeps[0] <= 40
+
+
+def test_retry_after_header_counts_too():
+    client, _, sleeps = client_for(
+        [(503, {}, {"retry-after": "30"}), (200, answer("ROTATION: 0\nok"))],
+    )
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
+    assert 30 <= sleeps[0] <= 33
+
+
+@pytest.mark.parametrize(
+    "details",
+    [None, "37s", [None, 5, {"retryDelay": 37}, {"retryDelay": "soon"}, {"retryDelay": "-5s"}]],
+)
+def test_odd_retry_hints_are_ignored(details):
+    limited = {"error": {"status": "RESOURCE_EXHAUSTED", "details": details}}
+    client, _, sleeps = client_for([(429, limited), (200, answer("ROTATION: 0\nok"))])
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
+    assert sleeps[0] <= 3
+
+
+def test_no_waiting_for_a_rate_limit_that_outlasts_the_document():
+    now = [100.0]
+    client, requests, sleeps = client_for([(429, RATE_LIMITED), (200, answer("ROTATION: 0\nok"))])
+    client._clock = lambda: now[0]
+    with pytest.raises(GeminiError, match="HTTP 429 RESOURCE_EXHAUSTED") as caught:
+        client.transcribe(b"data", "image/jpeg", "prompt", deadline=120.0)
+    assert caught.value.attempts == 1
+    assert len(requests) == 1
+    assert sleeps == []
+
+
+def test_no_waiting_for_a_limit_that_lasts_hours():
+    daily = {"error": {"status": "RESOURCE_EXHAUSTED", "details": [{"retryDelay": "40000s"}]}}
+    client, requests, sleeps = client_for([(429, daily), (200, answer("ROTATION: 0\nok"))])
+    with pytest.raises(GeminiError, match="HTTP 429"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert len(requests) == 1
+    assert sleeps == []
+
+
+def test_retry_after_as_a_point_in_time():
+    from datetime import datetime
+    from datetime import timedelta
+    from datetime import timezone
+    from email.utils import format_datetime
+
+    moment = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+    client, _, sleeps = client_for(
+        [(503, {}, {"retry-after": moment}), (200, answer("ROTATION: 0\nok"))],
+    )
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
+    assert 27 <= sleeps[0] <= 33
+
+
+def test_unreadable_retry_after_is_ignored():
+    client, _, sleeps = client_for(
+        [(503, {}, {"retry-after": "next week"}), (200, answer("ROTATION: 0\nok"))],
+    )
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
+    assert sleeps[0] <= 3

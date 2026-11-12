@@ -37,6 +37,7 @@ from .pages import analyse_pdf
 from .pages import normalise_text
 from .pages import pdf_page_texts
 from .pages import prepare_image
+from .pages import reads_like_text
 from .pipeline import DocumentResult
 from .pipeline import assemble
 from .pipeline import read_pages
@@ -45,6 +46,10 @@ if TYPE_CHECKING:
     from .pages import Page
 
 logger = logging.getLogger("paperless.parsing.gemini_ocr")
+
+# Failed pages that are read one at a time when a forced OCR run over all of
+# them gives no page boundaries. Each pass starts OCRmyPDF once.
+_SINGLE_PAGE_PASSES = 20
 
 
 class GeminiOcrParser(RasterisedDocumentParser):
@@ -140,6 +145,15 @@ class GeminiOcrParser(RasterisedDocumentParser):
                 outcome = self._collect(future, scan_pages)
 
         local_texts: dict[int, str] = {}
+        if not outcome.failures or in_consume:
+            # Not worth the OCR run when a reprocess is refused anyway.
+            local_texts = self._check_empty_pages(
+                document_path,
+                mime_type,
+                pages,
+                outcome,
+                first_pass_had_ocr=archive_from_ocr,
+            )
         if outcome.failures:
             if not in_consume:
                 raise ParseError(
@@ -147,13 +161,16 @@ class GeminiOcrParser(RasterisedDocumentParser):
                     f"{', '.join(str(n) for n in sorted(outcome.failures))}; "
                     "content left unchanged",
                 )
-            local_texts = self._local_texts(
-                document_path,
-                mime_type,
-                pages,
-                outcome,
-                first_pass_had_ocr=archive_from_ocr,
-            )
+            unread = [n for n in sorted(outcome.failures) if n not in local_texts]
+            if unread:
+                texts, _ = self._local_texts(
+                    document_path,
+                    mime_type,
+                    pages,
+                    unread,
+                    first_pass_had_ocr=archive_from_ocr,
+                )
+                local_texts.update(texts)
             state.set_report(
                 state.Report(total_pages=len(pages), failures=dict(outcome.failures)),
             )
@@ -245,7 +262,7 @@ class GeminiOcrParser(RasterisedDocumentParser):
             rotates = bool(user_args["rotate_pages"])
         return rotates
 
-    def _local_texts(
+    def _check_empty_pages(
         self,
         document_path: Path,
         mime_type: str,
@@ -254,25 +271,77 @@ class GeminiOcrParser(RasterisedDocumentParser):
         *,
         first_pass_had_ocr: bool,
     ) -> dict[int, str]:
-        """Best local text for exactly the pages the model failed on.
+        """Have local OCR look at the pages the model calls empty.
+
+        An empty answer for a page full of text would otherwise be imported
+        as an empty page without anyone noticing. Where local OCR does find
+        text, or could not look at the page at all, the page counts as
+        failed: it gets the local text and the document is flagged. Returns
+        the text of those pages. With local OCR switched off the model's word
+        is all there is.
+        """
+        from paperless.models import ModeChoices
+
+        empty = sorted(n for n, r in outcome.results.items() if not r.text.strip())
+        if not empty or self.settings.mode == ModeChoices.OFF:
+            return {}
+        texts, looked_at = self._local_texts(
+            document_path,
+            mime_type,
+            pages,
+            empty,
+            first_pass_had_ocr=first_pass_had_ocr,
+        )
+        doubted: dict[int, str] = {}
+        for number in empty:
+            if reads_like_text(texts[number]):
+                reason = "the model found no text on the page, local OCR did"
+            elif number not in looked_at:
+                # Not the same as an empty page: nobody has confirmed it.
+                reason = "the model found no text on the page, local OCR could not check it"
+            else:
+                continue
+            doubted[number] = texts[number]
+            del outcome.results[number]
+            outcome.failures[number] = reason
+        return doubted
+
+    def _local_texts(
+        self,
+        document_path: Path,
+        mime_type: str,
+        pages: list[Page],
+        failed: list[int],
+        *,
+        first_pass_had_ocr: bool,
+    ) -> tuple[dict[int, str], set[int]]:
+        """Best local text for exactly the given pages, and which of them OCR saw.
 
         In rising order of preference: the text layer the page brought along
         (a scanner's own, for instance), what the import's own OCR run found,
         and a forced OCR pass over the pages that still have nothing better.
+        A later source does not replace real text by a few stray characters.
+        The second value holds the pages an OCR run has a result for, empty
+        or not; for the others nothing is known.
         """
-        failed = sorted(outcome.failures)
         by_number = {p.number: p for p in pages}
         texts = {n: by_number[n].embedded_text for n in failed}
+        looked_at: set[int] = set()
+
+        def take(number: int, text: str) -> None:
+            if text.strip() and not (reads_like_text(texts[number]) and not reads_like_text(text)):
+                texts[number] = text
 
         need_ocr = failed
         if first_pass_had_ocr:
-            for number, text in self._first_pass_texts(pages, failed).items():
-                if text.strip():
-                    texts[number] = text
+            first_pass = self._first_pass_texts(pages, failed)
+            for number, text in first_pass.items():
+                take(number, text)
             if mime_type != "application/pdf":
                 # For an image the import's own run did OCR every page. For a
                 # PDF it may have skipped OCR because the file has text
                 # somewhere, so text found there proves nothing for a page.
+                looked_at.update(first_pass)
                 need_ocr = [n for n in failed if not texts[n].strip()]
 
         if need_ocr:
@@ -282,9 +351,9 @@ class GeminiOcrParser(RasterisedDocumentParser):
                 need_ocr,
                 by_number,
             ).items():
-                if text.strip():
-                    texts[number] = text
-        return texts
+                looked_at.add(number)
+                take(number, text)
+        return texts, looked_at
 
     def _first_pass_texts(self, pages: list[Page], failed: list[int]) -> dict[int, str]:
         """Text the import's own OCR run produced, per failed page."""
@@ -343,50 +412,89 @@ class GeminiOcrParser(RasterisedDocumentParser):
         return texts
 
     def _ocr_failed_pdf_pages(self, document_path: Path, failed: list[int]) -> dict[int, str]:
-        import pikepdf
-        from paperless.models import ModeChoices
+        """Text of the given PDF pages from a forced OCR pass, keyed by page.
 
+        A page missing from the result was not read.
+        """
+        limit = getattr(self.settings, "pages", None)
+        if isinstance(limit, int) and limit > 0:
+            # PAPERLESS_OCR_PAGES: OCR stops after that many pages, in a
+            # forced run too. What lies beyond stays unread.
+            failed = failed[:limit]
         try:
-            subset = Path(self.tempdir) / "gemini-ocr" / "failed-pages.pdf"
-            with pikepdf.open(document_path) as source:
-                only_failed = pikepdf.Pdf.new()
-                for number in failed:
-                    only_failed.pages.append(source.pages[number - 1])
-                only_failed.save(subset)
-                only_failed.close()
-
-            with RasterisedDocumentParser() as ocr:
-                ocr.settings.mode = ModeChoices.FORCE
-                ocr.parse(subset, "application/pdf", produce_archive=False)
-                whole = ocr.get_text() or ""
-                per_page: list[str] | None = None
-                # The built-in parser retries into a second file when its
-                # first attempt fails; that one is the good one then.
-                for name in ("archive-fallback.pdf", "archive.pdf"):
-                    output = Path(ocr.tempdir) / name
-                    if output.is_file():
-                        found = pdf_page_texts(output)
-                        if found is not None and len(found) == len(failed):
-                            per_page = found
-                            break
-
-            if len(failed) == 1:
-                return {failed[0]: whole or normalise_text((per_page or [""])[0])}
-            if per_page is not None:
-                mapped = {
-                    n: normalise_text(t) for n, t in zip(failed, per_page, strict=True)
-                }
-                if any(mapped.values()) or not whole:
-                    return mapped
-            # No page boundaries to go by. The file held the failed pages
-            # only, so their text is kept once, at the first of them.
-            return {failed[0]: whole}
+            per_page, whole = self._ocr_pdf_subset(document_path, failed)
         except Exception as e:
             self.log.warning(
                 "Gemini OCR: local OCR for the failed pages failed too (%s)",
                 type(e).__name__,
             )
             return {}
+        if per_page is not None:
+            return per_page
+        if len(failed) > _SINGLE_PAGE_PASSES:
+            # No page boundaries to go by and too many pages to read one by
+            # one. The file held these pages only, so their text is kept
+            # once, at the first of them.
+            return {failed[0]: whole}
+        # No page boundaries to go by: every page gets a pass of its own, so
+        # that its text cannot land on another page.
+        texts: dict[int, str] = {}
+        for number in failed:
+            try:
+                single, _ = self._ocr_pdf_subset(document_path, [number])
+            except Exception as e:
+                self.log.warning(
+                    "Gemini OCR: local OCR for failed page %d failed too (%s)",
+                    number,
+                    type(e).__name__,
+                )
+                continue
+            texts.update(single or {})
+        return texts
+
+    def _ocr_pdf_subset(
+        self,
+        document_path: Path,
+        numbers: list[int],
+    ) -> tuple[dict[int, str] | None, str]:
+        """Forced OCR over a file that holds only these pages.
+
+        Returns the text per page, or None when the output has no usable page
+        boundaries, and the text of all of them together.
+        """
+        import pikepdf
+        from paperless.models import ModeChoices
+
+        subset = Path(self.tempdir) / "gemini-ocr" / "failed-pages.pdf"
+        with pikepdf.open(document_path) as source:
+            only_these = pikepdf.Pdf.new()
+            for number in numbers:
+                only_these.pages.append(source.pages[number - 1])
+            only_these.save(subset)
+            only_these.close()
+
+        with RasterisedDocumentParser() as ocr:
+            ocr.settings.mode = ModeChoices.FORCE
+            ocr.parse(subset, "application/pdf", produce_archive=False)
+            whole = ocr.get_text() or ""
+            per_page: list[str] | None = None
+            # The built-in parser retries into a second file when its
+            # first attempt fails; that one is the good one then.
+            for name in ("archive-fallback.pdf", "archive.pdf"):
+                output = Path(ocr.tempdir) / name
+                if output.is_file():
+                    found = pdf_page_texts(output)
+                    if found is not None and len(found) == len(numbers):
+                        per_page = found
+                        break
+
+        if len(numbers) == 1:
+            return {numbers[0]: whole or normalise_text((per_page or [""])[0])}, whole
+        if per_page is not None:
+            mapped = {n: normalise_text(t) for n, t in zip(numbers, per_page, strict=True)}
+            if any(mapped.values()) or not whole:
+                return mapped, whole
+        return None, whole
 
     # ------------------------------------------------------------------
     # Rotation

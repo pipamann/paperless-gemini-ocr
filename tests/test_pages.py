@@ -11,6 +11,7 @@ from paperless_gemini_ocr.pages import load_payload
 from paperless_gemini_ocr.pages import looks_broken
 from paperless_gemini_ocr.pages import normalise_text
 from paperless_gemini_ocr.pages import prepare_image
+from paperless_gemini_ocr.pages import reads_like_text
 
 CFG = Config(api_key="k")
 
@@ -763,3 +764,55 @@ def test_forms_sharing_the_page_resources_can_still_be_exported(tmp_path, workdi
     pages = analyse_pdf(path, CFG, workdir)
     assert kinds(pages) == ["gemini"]
     assert pages[0].payload is not None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", False),
+        (None, False),
+        (" . | — ,, 1 7 ii", False),
+        ("Seite 3 von 5", False),
+        ("Invoice 12345 total 99.50 EUR net", True),
+        ("Sehr geehrte Damen und Herren, anbei die Rechnung", True),
+        ("חשבונית מספר שלוש מאות עשרים וחמש", True),
+    ],
+)
+def test_reads_like_text(text, expected):
+    assert reads_like_text(text) is expected
+
+
+def test_copy_of_a_pdf_page_is_deleted_once_it_is_read(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["scan", "scan"]), CFG, workdir)
+    copy = pages[0].payload
+    assert copy.is_file()
+    data, mime = load_payload(pages[0], CFG, workdir)
+    assert mime == "application/pdf"
+    assert data.startswith(b"%PDF")
+    assert not copy.exists()
+    assert pages[1].payload.is_file()
+
+
+def test_rendered_page_is_deleted_once_it_is_read(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["scan"]), CFG, workdir)
+    data, mime = load_payload(pages[0], Config(api_key="k", page_input="image"), workdir)
+    assert mime == "image/jpeg"
+    assert list(workdir.glob("render-*")) == []
+
+
+def test_image_file_stays_for_local_ocr(tmp_path, workdir):
+    path = tmp_path / "scan.jpg"
+    Image.new("RGB", (60, 80), "white").save(path, "JPEG")
+    pages = prepare_image(path, "image/jpeg", workdir)
+    load_payload(pages[0], CFG, workdir)
+    assert path.is_file()
+
+
+def test_page_copy_too_large_to_send_is_not_kept(pdf_factory, workdir, monkeypatch):
+    from paperless_gemini_ocr import pages as pages_module
+
+    monkeypatch.setattr(pages_module, "MAX_INLINE_BYTES", 100)
+    pages = analyse_pdf(pdf_factory(["scan"]), CFG, workdir)
+    assert pages[0].kind == "gemini"
+    assert pages[0].payload is None
+    assert list(workdir.glob("page-*")) == []
