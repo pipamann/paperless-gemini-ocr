@@ -22,8 +22,8 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
   `ocr-review` with a note naming the pages. Nothing is silently worse.
 - "Reprocess" on an existing document uses the plugin too. There a model
   failure aborts the task, so good text is never replaced by fallback text.
-- Pages the model reports as rotated are turned upright in the archive PDF.
-  The original file is never modified.
+- Pages the model reports as upside down are turned upright in the archive
+  PDF. The original file is never modified.
 
 Archive PDF, thumbnail, page count and metadata come from the built-in
 Tesseract parser, which this plugin extends.
@@ -88,7 +88,7 @@ All variables are optional except the API key.
 | `PAPERLESS_GEMINI_OCR_DIGITAL_PAGES` | `embedded` | `embedded` keeps embedded text, `gemini` sends every page. |
 | `PAPERLESS_GEMINI_OCR_SCAN_IMAGE_COVERAGE` | `0.7` | Share of a page covered by images from which it counts as a scan. |
 | `PAPERLESS_GEMINI_OCR_LOCAL_OCR` | `fallback` | `fallback`: Tesseract only runs for pages the model failed on. `always`: Tesseract runs for every scan and the archive PDF keeps a text layer. |
-| `PAPERLESS_GEMINI_OCR_ROTATE` | `true` | Turn rotated pages upright in the archive PDF. |
+| `PAPERLESS_GEMINI_OCR_ROTATE` | `upside-down` | `upside-down`: turn pages the model reports as rotated by 180° upright in the archive PDF. `all`: also 90° and 270° (the model sometimes confuses the two). `off`: never. |
 | `PAPERLESS_GEMINI_OCR_FAILURE_TAG` | `ocr-review` | Tag for documents with failed pages; empty disables it. |
 | `PAPERLESS_GEMINI_OCR_FAILURE_NOTE` | `true` | Add a note naming the failed pages. |
 | `PAPERLESS_GEMINI_OCR_PROMPT_FILE` | – | Path to your own prompt. |

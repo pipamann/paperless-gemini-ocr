@@ -263,3 +263,24 @@ def test_flagging_errors_never_break_the_import(configured, monkeypatch, pdf_fac
         pk = 7
 
     document_consumption_finished.send(sender=None, document=Doc)
+
+
+def test_sideways_pages_are_only_turned_when_asked(configured, monkeypatch, pdf_factory):
+    answers = {1: PageResult(text="a", rotation=90)}
+    model_answers(monkeypatch, results=answers)
+    parser = consume(pdf_factory(["scan"]))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert "/Rotate" not in archive.pages[0].obj
+
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_ROTATE", "all")
+    parser = consume(pdf_factory(["scan"], name="second.pdf"))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert int(archive.pages[0].obj["/Rotate"]) == 90
+
+
+def test_rotation_can_be_switched_off(configured, monkeypatch, pdf_factory):
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_ROTATE", "off")
+    model_answers(monkeypatch, results={1: PageResult(text="a", rotation=180)})
+    parser = consume(pdf_factory(["scan"]))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert "/Rotate" not in archive.pages[0].obj

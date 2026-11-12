@@ -161,8 +161,12 @@ class GeminiOcrParser(RasterisedDocumentParser):
 
         self.text = assemble(pages, outcome, local_texts)
 
-        if cfg.rotate and not ocr_ran:
-            self._apply_rotation(pages, outcome)
+        if cfg.rotate != "off" and not ocr_ran:
+            self._apply_rotation(
+                pages,
+                outcome,
+                (180,) if cfg.rotate == "upside-down" else (90, 180, 270),
+            )
 
         self.log.info(
             "Gemini OCR: %d page(s), %d read by %s in %.1f s (%d request(s), "
@@ -277,12 +281,17 @@ class GeminiOcrParser(RasterisedDocumentParser):
     # Rotation
     # ------------------------------------------------------------------
 
-    def _apply_rotation(self, pages: list[Page], outcome: DocumentResult) -> None:
+    def _apply_rotation(
+        self,
+        pages: list[Page],
+        outcome: DocumentResult,
+        accepted: tuple[int, ...],
+    ) -> None:
         """Turn pages upright in the archive PDF. The original is never touched."""
         turns = {
             number: result.rotation
             for number, result in outcome.results.items()
-            if result.rotation in (90, 180, 270)
+            if result.rotation in accepted
         }
         if not turns:
             return

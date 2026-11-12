@@ -105,7 +105,10 @@ class Config:
     # the archive PDF keeps its text layer.
     local_ocr: str = "fallback"
     # Turn pages upright in the archive PDF when the model reports a rotation.
-    rotate: bool = True
+    # "upside-down": only pages reported as rotated by 180 degrees. The model
+    # is reliable there, while it sometimes confuses 90 and 270.
+    # "all": every reported rotation. "off": never.
+    rotate: str = "upside-down"
 
     # Tag (and note) for documents where the model failed and local OCR text
     # was used instead. Empty string disables the tag.
@@ -161,7 +164,11 @@ class Config:
                 defaults.local_ocr,
                 ("fallback", "always"),
             ),
-            rotate=_get_bool("ROTATE", defaults.rotate),
+            rotate=_get_choice(
+                "ROTATE",
+                defaults.rotate,
+                ("upside-down", "all", "off"),
+            ),
             failure_tag=os.environ.get(PREFIX + "FAILURE_TAG", defaults.failure_tag).strip(),
             failure_note=_get_bool("FAILURE_NOTE", defaults.failure_note),
             prompt_file=_get("PROMPT_FILE"),
