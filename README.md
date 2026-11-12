@@ -15,13 +15,16 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
 - Pages with real embedded text (born-digital PDFs) keep that text and are
   never sent anywhere. The decision is made per page, so a contract with a
   scanned signature page gets both.
-- A PDF counts as a scan when an image covers most of the page, even if the
-  scanner added its own text layer.
-- If the model fails for a page, the import still succeeds: that page gets
-  the text of the local OCR (Tesseract), and the document is tagged
-  `ocr-review` with a note naming the pages. Nothing is silently worse.
+- A PDF page counts as a scan when an image covers most of it, even if the
+  scanner added its own text layer. Whatever is doubtful (no text layer, a
+  large image with only a caption, content the analysis cannot see into) goes
+  to the model, because calling a scan "digital" would lose its content.
+- If the model fails for a page, the import still succeeds: Tesseract reads
+  exactly the failed pages, and the document is tagged `ocr-review` with a
+  note naming them. Nothing is silently worse.
 - "Reprocess" on an existing document uses the plugin too. There a model
-  failure aborts the task, so good text is never replaced by fallback text.
+  failure aborts the reprocessing, so good text is never replaced by fallback
+  text: the document stays as it was and Paperless logs the error.
 - Pages the model reports as upside down are turned upright in the archive
   PDF. The original file is never modified.
 

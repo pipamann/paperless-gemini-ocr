@@ -307,6 +307,28 @@ def functional() -> None:
     check("model down: three attempts per page", stats()["requests"] == 6, stats())
     check("model down: found by tag filter", any(d["id"] == doc["id"] for d in api.get("/api/documents/", params={"tags__id__all": tag}).json()["results"]) if tag else False, "")
 
+    # --- model down, mixed PDF: Paperless sees text and would skip OCR; the
+    #     scanned page must get OCR text all the same
+    control(mode="fail")
+    digital, scanned = uid(), uid()
+    doc = document(consume("mixed-down", "pdf", mixed_pdf(letter(digital), letter(scanned)))["id"])
+    check("model down, mixed: embedded page kept", digital in doc["content"], doc["content"][:160])
+    check("model down, mixed: scanned page read by local OCR", "Gesamtbetrag" in doc["content"].split(digital, 1)[-1].split("Gesamtbetrag", 1)[-1] or doc["content"].count("Gesamtbetrag") == 2, doc["content"][-300:])
+    check("model down, mixed: flagged", review_tag_id() in doc["tags"], doc["tags"])
+
+    # --- model down, scan with scanner text layer (Paperless produces no archive)
+    control(mode="fail")
+    marker = uid()
+    doc = document(consume("layer-down", "pdf", scanner_pdf(letter(marker)))["id"])
+    check("model down, scanner layer: text present", "Musterfirma" in doc["content"], doc["content"][:200])
+    check("model down, scanner layer: flagged", review_tag_id() in doc["tags"], doc["tags"])
+
+    # --- model down, JPG: archive is still produced and valid
+    control(mode="fail")
+    doc = document(consume("jpg-down", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    check("model down, jpg: local OCR text", "Musterfirma" in doc["content"], doc["content"][:120])
+    check("model down, jpg: archive readable", archive_rotation(doc["id"]) == [0], "")
+
     # --- one failed attempt, then fine: no flag
     control(mode="flaky", fail_first=1)
     doc = document(consume("flaky", "jpg", jpeg(page_image(letter(uid()))))["id"])
