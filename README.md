@@ -39,23 +39,27 @@ marks for remote OCR are sent; everything else is processed locally.
 ## Installation (Docker)
 
 1. Download the wheel from the releases page into a folder next to your
-   `docker-compose.yml`, for example `./plugins/`.
-2. Add an install script, `./plugins/install.sh`:
+   `docker-compose.yml`, for example `./gemini-ocr/`.
+2. Put an install script into the same folder, `./gemini-ocr/install.sh`, and
+   make it executable (`chmod +x`):
 
    ```bash
    #!/bin/bash
-   pip install --no-index --no-deps /custom-cont-init.d/paperless_gemini_ocr-*.whl
+   set -e
+   pip install --no-index --no-deps /opt/gemini-ocr/paperless_gemini_ocr-*.whl
    ```
 
    The plugin only needs libraries Paperless-ngx already ships, so nothing is
    downloaded when the container starts.
-3. Mount the folder and set the API key:
+3. Mount both and set the API key. Paperless runs every file it finds in
+   `/custom-cont-init.d`, so only the script goes there:
 
    ```yaml
    services:
      webserver:
        volumes:
-         - ./plugins:/custom-cont-init.d:ro
+         - ./gemini-ocr/install.sh:/custom-cont-init.d/install-gemini-ocr.sh:ro
+         - ./gemini-ocr:/opt/gemini-ocr:ro
        environment:
          PAPERLESS_GEMINI_OCR_API_KEY: ${GEMINI_API_KEY}
    ```
@@ -67,7 +71,7 @@ marks for remote OCR are sent; everything else is processed locally.
    ```
 
 Without an API key the plugin stays inactive and Paperless behaves as before.
-To remove it, delete the mount and recreate the container.
+To remove it, delete the two mounts and recreate the container.
 
 ## Configuration
 
