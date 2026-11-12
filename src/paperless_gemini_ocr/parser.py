@@ -31,6 +31,7 @@ from paperless.parsers.tesseract import RasterisedDocumentParser
 from . import __version__
 from . import state
 from .config import Config
+from .pages import AnalysisError
 from .pages import _inherited
 from .pages import analyse_pdf
 from .pages import normalise_text
@@ -93,7 +94,9 @@ class GeminiOcrParser(RasterisedDocumentParser):
             else:
                 pages = prepare_image(document_path, mime_type, workdir)
         except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
+            # Own errors carry a text written for the note; of anything else
+            # only the kind is kept.
+            reason = str(e) if isinstance(e, AnalysisError) else type(e).__name__
             if not in_consume:
                 raise ParseError(
                     f"Gemini OCR could not process the document ({reason}); "
@@ -157,8 +160,9 @@ class GeminiOcrParser(RasterisedDocumentParser):
 
         self.text = assemble(pages, outcome, local_texts)
 
-        # OCRmyPDF turns pages itself; turning them again would undo that.
-        if cfg.rotate != "off" and not archive_from_ocr:
+        # Where OCRmyPDF made the archive and turns pages itself, turning
+        # them again would undo that.
+        if cfg.rotate != "off" and not (archive_from_ocr and self._local_ocr_rotates()):
             self._apply_rotation(
                 pages,
                 outcome,
@@ -228,6 +232,19 @@ class GeminiOcrParser(RasterisedDocumentParser):
         super().parse(document_path, mime_type, produce_archive=produce_archive)
         return True
 
+    def _local_ocr_rotates(self) -> bool:
+        """Whether a local OCR run turns pages (PAPERLESS_OCR_ROTATE_PAGES)."""
+        from paperless.models import ModeChoices
+
+        if self.settings.mode == ModeChoices.OFF:
+            return False
+        rotates = bool(getattr(self.settings, "rotate", False))
+        # PAPERLESS_OCR_USER_ARGS is merged over the regular settings.
+        user_args = getattr(self.settings, "user_args", None)
+        if isinstance(user_args, dict) and "rotate_pages" in user_args:
+            rotates = bool(user_args["rotate_pages"])
+        return rotates
+
     def _local_texts(
         self,
         document_path: Path,
@@ -263,7 +280,7 @@ class GeminiOcrParser(RasterisedDocumentParser):
                 document_path,
                 mime_type,
                 need_ocr,
-                len(pages),
+                by_number,
             ).items():
                 if text.strip():
                     texts[number] = text
@@ -287,39 +304,60 @@ class GeminiOcrParser(RasterisedDocumentParser):
         document_path: Path,
         mime_type: str,
         failed: list[int],
-        total_pages: int,
+        by_number: dict[int, Page],
     ) -> dict[int, str]:
         """Run Tesseract over the failed pages only and return their text.
 
         A separate pass with forced OCR, because the regular modes may skip
-        OCR (a PDF that already has text). It runs in a parser instance of its
-        own, with its own working directory: whatever it writes, leaves behind
-        or raises cannot touch the text and the archive of this import.
+        OCR (a PDF that already has text). It runs in parser instances of its
+        own, with their own working directories: whatever they write, leave
+        behind or raise cannot touch the text and the archive of this import.
         """
-        import pikepdf
         from paperless.models import ModeChoices
 
         if self.settings.mode == ModeChoices.OFF:
             # OCR is switched off for this installation; respect that.
             return {}
+        if mime_type == "application/pdf":
+            return self._ocr_failed_pdf_pages(document_path, failed)
+
+        # Images: every page has a file of its own (the image itself, or one
+        # JPEG per frame of a multi-page TIFF), so each failed one is read
+        # alone and its text cannot land on another page.
+        texts: dict[int, str] = {}
+        for number in failed:
+            page = by_number[number]
+            if page.payload is None or page.mime_type is None:
+                continue
+            try:
+                with RasterisedDocumentParser() as ocr:
+                    ocr.settings.mode = ModeChoices.FORCE
+                    ocr.parse(page.payload, page.mime_type, produce_archive=False)
+                    texts[number] = ocr.get_text() or ""
+            except Exception as e:
+                self.log.warning(
+                    "Gemini OCR: local OCR for failed page %d failed too (%s)",
+                    number,
+                    type(e).__name__,
+                )
+        return texts
+
+    def _ocr_failed_pdf_pages(self, document_path: Path, failed: list[int]) -> dict[int, str]:
+        import pikepdf
+        from paperless.models import ModeChoices
 
         try:
-            if mime_type == "application/pdf":
-                subset = Path(self.tempdir) / "gemini-ocr" / "failed-pages.pdf"
-                with pikepdf.open(document_path) as source:
-                    only_failed = pikepdf.Pdf.new()
-                    for number in failed:
-                        only_failed.pages.append(source.pages[number - 1])
-                    only_failed.save(subset)
-                    only_failed.close()
-                numbers = failed
-            else:
-                subset = document_path
-                numbers = list(range(1, total_pages + 1))
+            subset = Path(self.tempdir) / "gemini-ocr" / "failed-pages.pdf"
+            with pikepdf.open(document_path) as source:
+                only_failed = pikepdf.Pdf.new()
+                for number in failed:
+                    only_failed.pages.append(source.pages[number - 1])
+                only_failed.save(subset)
+                only_failed.close()
 
             with RasterisedDocumentParser() as ocr:
                 ocr.settings.mode = ModeChoices.FORCE
-                ocr.parse(subset, mime_type, produce_archive=False)
+                ocr.parse(subset, "application/pdf", produce_archive=False)
                 whole = ocr.get_text() or ""
                 per_page: list[str] | None = None
                 # The built-in parser retries into a second file when its
@@ -328,21 +366,20 @@ class GeminiOcrParser(RasterisedDocumentParser):
                     output = Path(ocr.tempdir) / name
                     if output.is_file():
                         found = pdf_page_texts(output)
-                        if found is not None and len(found) == len(numbers):
+                        if found is not None and len(found) == len(failed):
                             per_page = found
                             break
 
-            if len(numbers) == 1:
-                return {numbers[0]: whole or normalise_text((per_page or [""])[0])}
+            if len(failed) == 1:
+                return {failed[0]: whole or normalise_text((per_page or [""])[0])}
             if per_page is not None:
                 mapped = {
-                    n: normalise_text(t)
-                    for n, t in zip(numbers, per_page, strict=True)
-                    if n in failed
+                    n: normalise_text(t) for n, t in zip(failed, per_page, strict=True)
                 }
                 if any(mapped.values()) or not whole:
                     return mapped
-            # No page boundaries to go by: keep what OCR found, once.
+            # No page boundaries to go by. The file held the failed pages
+            # only, so their text is kept once, at the first of them.
             return {failed[0]: whole}
         except Exception as e:
             self.log.warning(

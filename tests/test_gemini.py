@@ -30,6 +30,16 @@ def answer(text: str, finish: str = "STOP", thought: str | None = None) -> dict:
     }
 
 
+class Body(httpx.SyncByteStream):
+    """An answer that still has to be read, as it comes from a real connection."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __iter__(self):
+        yield self.data
+
+
 def client_for(responses: list, cfg: Config = CFG):
     """Client whose transport plays ``responses`` in order and records requests."""
     requests: list[httpx.Request] = []
@@ -42,7 +52,7 @@ def client_for(responses: list, cfg: Config = CFG):
         if isinstance(item, Exception):
             raise item
         status, payload = item
-        return httpx.Response(status, json=payload)
+        return httpx.Response(status, stream=Body(json.dumps(payload).encode()))
 
     http = httpx.Client(transport=httpx.MockTransport(handler))
     return GeminiClient(cfg, http, sleep=sleeps.append), requests, sleeps
@@ -170,7 +180,9 @@ def test_timeout_and_connection_errors_are_retried():
 
 def test_document_deadline_stops_further_requests():
     now = [100.0]
-    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500, json={})))
+    http = httpx.Client(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500, stream=Body(b"{}"))),
+    )
     client = GeminiClient(CFG, http, sleep=lambda s: None, clock=lambda: now[0])
     with pytest.raises(GeminiError, match="time limit"):
         client.transcribe(b"data", "image/jpeg", "prompt", deadline=100.5)
@@ -190,3 +202,133 @@ def test_empty_text_needs_a_valid_protocol_line(raw):
     with pytest.raises(GeminiError, match="without text"):
         client.transcribe(b"data", "image/jpeg", "prompt")
     assert len(requests) == 3
+
+
+@pytest.mark.parametrize("body", [[{"error": "x"}], "Service Unavailable", None, {"error": "rate limit"}])
+def test_error_body_of_another_shape_is_still_retried(body):
+    client, requests, _ = client_for([(503, body), (200, answer("ROTATION: 0\nok"))])
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("body", [[1, 2], "text", {"candidates": "none"}, {"candidates": [5]}])
+def test_answer_of_another_shape_counts_as_temporary_failure(body):
+    client, requests, _ = client_for([(200, body)] * 3)
+    with pytest.raises(GeminiError, match="unexpected structure|without candidates"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert len(requests) == 3
+
+
+def test_status_words_from_the_endpoint_are_not_passed_on_verbatim():
+    """Whatever a broken endpoint echoes there, the key included, stays out."""
+    echoes = [
+        (403, {"error": {"status": "key secret-key"}}),
+        (200, {"promptFeedback": {"blockReason": "secret-key"}}),
+        (200, {"candidates": [{"finishReason": "secret-key", "content": {}}]}),
+    ]
+    for item in echoes:
+        client, _, _ = client_for([item] * 3)
+        with pytest.raises(GeminiError) as caught:
+            client.transcribe(b"data", "image/jpeg", "prompt")
+        assert "secret-key" not in str(caught.value)
+        assert "UNKNOWN" in str(caught.value)
+
+
+def test_slowly_dripping_answer_runs_into_the_request_time():
+    """httpx only limits each read; the total is watched here."""
+    now = [0.0]
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(1000):
+                now[0] += 10.0
+                yield b" "
+
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Drip())))
+    client = GeminiClient(
+        Config(api_key="k", base_url="https://gemini.test/v1beta", max_attempts=1, request_timeout=30),
+        http,
+        sleep=lambda s: None,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(GeminiError, match="no answer within 30 s"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert now[0] <= 50.0
+
+
+def test_oversized_answer_is_refused():
+    class Flood(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(40):
+                yield b"x" * (1024 * 1024)
+
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Flood())))
+    client = GeminiClient(CFG, http, sleep=lambda s: None)
+    with pytest.raises(GeminiError, match="too large"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+
+
+def test_compressed_answers_are_not_asked_for():
+    client, requests, _ = client_for([(200, answer("ROTATION: 0\nok"))])
+    client.transcribe(b"data", "image/jpeg", "prompt")
+    assert requests[0].headers["accept-encoding"] == "identity"
+
+
+def compressed_client(content: bytes, encoding: str = "gzip", **kwargs):
+    http = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(
+                200,
+                stream=Body(content),
+                headers={"content-encoding": encoding},
+            ),
+        ),
+    )
+    return GeminiClient(CFG, http, sleep=lambda s: None, **kwargs)
+
+
+def test_compressed_answer_is_read_all_the_same():
+    import gzip
+
+    body = json.dumps(answer("ROTATION: 0\nkomprimiert")).encode()
+    assert compressed_client(gzip.compress(body)).transcribe(b"d", "image/jpeg", "p").text == "komprimiert"
+
+
+def test_compressed_answer_cannot_unpack_past_the_size_limit():
+    """40 kB that unpack to 40 MB: stopped at the limit, not after it."""
+    import gzip
+
+    with pytest.raises(GeminiError, match="too large"):
+        compressed_client(gzip.compress(b" " * (40 * 1024 * 1024))).transcribe(b"d", "image/jpeg", "p")
+
+
+def test_unknown_answer_encoding_is_refused():
+    with pytest.raises(GeminiError, match="unexpected encoding"):
+        compressed_client(b"x", encoding="gzip, gzip").transcribe(b"d", "image/jpeg", "p")
+
+
+def test_request_time_counts_even_when_nothing_can_be_unpacked_yet():
+    """A gzip header that never ends yields no data; the clock is still watched."""
+    now = [0.0]
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            yield bytes([0x1F, 0x8B, 8, 0x08, 0, 0, 0, 0, 0, 3])  # header with a file name to follow
+            for _ in range(1000):
+                now[0] += 10.0
+                yield b"a"
+
+    http = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, stream=Drip(), headers={"content-encoding": "gzip"}),
+        ),
+    )
+    client = GeminiClient(
+        Config(api_key="k", base_url="https://gemini.test/v1beta", max_attempts=1, request_timeout=30),
+        http,
+        sleep=lambda s: None,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(GeminiError, match="no answer within 30 s"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert now[0] <= 50.0

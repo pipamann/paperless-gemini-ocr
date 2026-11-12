@@ -58,6 +58,18 @@ _MAX_ANNOTATIONS = 500
 # as scans without being looked at.
 _ANALYSIS_SECONDS = 120.0
 _IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+# ASCII85 data beyond this size is not decoded: Python's decoder keeps a list
+# entry per four bytes of output, about fifty times the size of the data.
+_A85_INPUT_LIMIT = 256 * 1024
+# Longer edge of a rendered page in pixels. A3 at 200 dpi has 3300; a page
+# box of any size, real plotter sheet or crafted, never makes a larger bitmap.
+_MAX_RENDER_EDGE = 5000
+_MIN_RENDER_EDGE = 256
+# Images: frames of one file, pixels of one frame (larger ones are refused),
+# and the size from which a frame is halved before it is converted.
+_MAX_FRAMES = 2000
+_MAX_FRAME_PIXELS = 120_000_000
+_WORK_PIXELS = 40_000_000
 
 
 class AnalysisError(Exception):
@@ -98,6 +110,9 @@ def _decode_stage(name: str, data: bytes, limit: int) -> bytes | None:
             return out
         if name in ("/ASCII85Decode", "/A85"):
             body = b"".join(data.split())
+            # "z" stands for four zero bytes.
+            if len(body) > _A85_INPUT_LIMIT or 4 * body.count(b"z") + len(body) > limit:
+                return None
             if not body.startswith(b"<~"):
                 body = b"<~" + body
             if not body.endswith(b"~>"):
@@ -185,6 +200,8 @@ class Page:
     # Set for PDF pages, so the page can be rendered when the single-page PDF
     # is too large or images are configured.
     source_pdf: Path | None = None
+    # Longer edge of a PDF page in points (1/72 inch), 0 when unknown.
+    long_edge: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +420,42 @@ def _annotation_area(page, page_area: float) -> float:
     return area
 
 
+def _charge_resource_forms(resources, budget: _Budget, seen: set, depth: int = 0) -> None:
+    """Charge every form a resource dictionary lists, painted or not.
+
+    The clean-up of a page copy (``remove_unreferenced_resources``) parses
+    all of them, also those the page never paints, which ``image_coverage``
+    therefore never saw. It does so once per name, so a form listed under a
+    thousand names is charged a thousand times; only the way down into a
+    form's own resources is taken once.
+    """
+    xobjects = resources.get("/XObject") if resources is not None else None
+    if xobjects is None:
+        return
+    for name in xobjects.keys():
+        budget.charge_instructions(1)
+        xobject = xobjects.get(name)
+        if xobject is None or str(xobject.get("/Subtype")) != "/Form":
+            continue
+        budget.charge_stream(xobject)
+        key = xobject.objgen
+        if key in seen:
+            continue
+        seen.add(key)
+        if depth >= _MAX_FORM_DEPTH:
+            raise _BudgetExceeded
+        _charge_resource_forms(xobject.get("/Resources"), budget, seen, depth + 1)
+
+
+def _long_edge(page) -> float:
+    try:
+        box = _inherited(page.obj, "/MediaBox") or _inherited(page.obj, "/CropBox")
+        x0, y0, x1, y1 = (float(v) for v in box)
+        return max(abs(x1 - x0), abs(y1 - y0))
+    except Exception:
+        return 0.0
+
+
 def _has_appearances(page) -> bool:
     annots = page.obj.get("/Annots")
     if annots is None:
@@ -463,6 +516,7 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
             page = Page(number=number, kind=kind, reason=reason, embedded_text=text)
             if kind == "gemini":
                 page.source_pdf = path
+                page.long_edge = _long_edge(pdf_page)
                 target = workdir / f"page-{number:05d}.pdf"
                 try:
                     if not analysed:
@@ -475,13 +529,25 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
                         # resources, which the clean-up below cannot see.
                         # Such a page is rendered instead (load_payload).
                         raise AnalysisError("page has annotation appearances")
+                    # Raises when the forms need more work than the analysis
+                    # allows; the page is rendered then.
+                    _charge_resource_forms(
+                        _inherited(pdf_page.obj, "/Resources"),
+                        _Budget(),
+                        set(),
+                    )
                     single = pikepdf.Pdf.new()
                     single.pages.append(pdf_page)
                     # Pages often share one resource dictionary. Without this
                     # the upload would carry the images and text of other
                     # pages along, unused but readable.
                     single.pages[0].remove_unreferenced_resources()
-                    single.save(target)
+                    # Streams are copied as they are, nothing is unpacked.
+                    single.save(
+                        target,
+                        compress_streams=False,
+                        stream_decode_level=pikepdf.StreamDecodeLevel.none,
+                    )
                     single.close()
                     page.payload = target
                     page.mime_type = "application/pdf"
@@ -492,20 +558,32 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
     return pages
 
 
+def render_edge(long_edge: float, dpi: int) -> int:
+    """Pixels for the longer edge of a rendered page: ``dpi``, within fixed bounds."""
+    # Unknown size: assume A4.
+    wanted = round((long_edge if long_edge > 0 else 842.0) / 72 * dpi)
+    return max(_MIN_RENDER_EDGE, min(_MAX_RENDER_EDGE, wanted))
+
+
 def render_page(
     pdf_path: Path,
     number: int,
-    dpi: int,
+    edge: int,
     workdir: Path,
     timeout: float = 180.0,
 ) -> Path:
+    """Render one page as JPEG whose longer edge has ``edge`` pixels.
+
+    The size is given in pixels and not as a resolution, so the bitmap
+    pdftoppm allocates does not depend on what the page claims as its size.
+    """
     prefix = workdir / f"render-{number:05d}"
     subprocess.run(
         [
             "pdftoppm",
             "-q",
-            "-r",
-            str(dpi),
+            "-scale-to",
+            str(edge),
             "-jpeg",
             "-f",
             str(number),
@@ -527,24 +605,99 @@ def render_page(
 # ---------------------------------------------------------------------------
 
 
+# Orientation tag (EXIF) -> PIL.Image.Transpose value that turns the pixels
+# upright. Only the turned ones: img2pdf cannot express the mirrored ones in a
+# PDF and ignores them, and the model has to see what the archive shows.
+_ORIENTATION = {3: 3, 6: 4, 8: 2}
+
+
+def _upright_rgb(frame):
+    """RGB copy of bounded size, as a viewer shows the image.
+
+    The archive PDF is made by img2pdf, which honours the orientation tag,
+    and the model has to see the page the same way round. Transparent areas
+    become white instead of whatever colour hides under them.
+    """
+    from PIL import Image
+
+    pixels = frame.width * frame.height
+    if pixels > _MAX_FRAME_PIXELS:
+        raise AnalysisError("image has too many pixels")
+    # Pillow turns a TIFF by its tag while loading and drops the tag; for
+    # JPEG and PNG it leaves both alone. Asked after loading, the tag says
+    # what is still to be done.
+    frame.load()
+    try:
+        orientation = frame.getexif().get(0x0112)
+    except Exception:
+        orientation = None
+    transparent = frame.mode in ("RGBA", "LA", "PA") or (
+        frame.mode == "P" and "transparency" in frame.info
+    )
+    image = frame
+    if pixels > _WORK_PIXELS:
+        if image.mode == "1":
+            image = image.convert("L")
+        factor = 2 if pixels <= 4 * _WORK_PIXELS else 3
+        try:
+            image = image.reduce(factor)
+        except ValueError:
+            image = image.resize(
+                (max(1, image.width // factor), max(1, image.height // factor)),
+                Image.Resampling.NEAREST,
+            )
+    if transparent:
+        rgba = image.convert("RGBA")
+        image = Image.new("RGB", rgba.size, "white")
+        image.paste(rgba, mask=rgba.getchannel("A"))
+    else:
+        image = image.convert("RGB")
+    method = _ORIENTATION.get(orientation)
+    if method is not None:
+        image = image.transpose(Image.Transpose(method))
+    return image
+
+
 def _save_jpeg(frame, target: Path) -> None:
     """Write an RGB JPEG that fits into one request, shrinking if it must."""
-    image = frame.convert("RGB")
+    image = _upright_rgb(frame)
+    # Local OCR, should it be needed for this frame, wants a resolution.
+    dpi = frame.info.get("dpi")
+    extra = {}
+    try:
+        # The longer edge stays the longer edge when the image is turned.
+        shrunk = max(image.size) / max(frame.size)
+        if dpi and float(dpi[0]) > 1 and float(dpi[1]) > 1:
+            extra["dpi"] = (
+                max(1, round(float(dpi[0]) * shrunk)),
+                max(1, round(float(dpi[1]) * shrunk)),
+            )
+    except (TypeError, ValueError, IndexError, ZeroDivisionError):
+        extra = {}
     quality = 90
     for _ in range(6):
-        image.save(target, "JPEG", quality=quality)
+        image.save(target, "JPEG", quality=quality, **extra)
         if target.stat().st_size <= MAX_INLINE_BYTES:
             return
         if quality > 75:
             quality -= 10
         else:
-            image = image.resize((image.width * 3 // 4, image.height * 3 // 4))
+            image = image.resize(
+                (max(1, image.width * 3 // 4), max(1, image.height * 3 // 4)),
+            )
+            if "dpi" in extra:
+                extra["dpi"] = (
+                    max(1, extra["dpi"][0] * 3 // 4),
+                    max(1, extra["dpi"][1] * 3 // 4),
+                )
     raise AnalysisError("image cannot be reduced to an uploadable size")
 
 
 def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
     """One page per image; multi-page TIFFs give one page per frame."""
     if mime_type in GEMINI_IMAGE_TYPES and path.stat().st_size <= MAX_INLINE_BYTES:
+        # Sent as it is. The model honours the orientation tag like img2pdf
+        # does (checked with gemini-3.8-flash), so both see the same page.
         return [
             Page(number=1, kind="gemini", reason="image", payload=path, mime_type=mime_type),
         ]
@@ -552,11 +705,25 @@ def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
     from PIL import Image
 
     pages: list[Page] = []
+    give_up_at = time.monotonic() + _ANALYSIS_SECONDS
     try:
         with Image.open(path) as image:
-            frames = getattr(image, "n_frames", 1) if image.format == "TIFF" else 1
-            for index in range(frames):
-                image.seek(index)
+            multi = image.format == "TIFF"
+            index = 0
+            while True:
+                if time.monotonic() > give_up_at:
+                    raise AnalysisError("image takes too long to prepare")
+                if index:
+                    # Frames are taken one by one. Asking for their number
+                    # first would walk the whole file before any limit.
+                    if not multi:
+                        break
+                    try:
+                        image.seek(index)
+                    except EOFError:
+                        break
+                    if index >= _MAX_FRAMES:
+                        raise AnalysisError(f"image file has more than {_MAX_FRAMES} frames")
                 target = workdir / f"frame-{index + 1:05d}.jpg"
                 _save_jpeg(image, target)
                 pages.append(
@@ -568,6 +735,7 @@ def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
                         mime_type="image/jpeg",
                     ),
                 )
+                index += 1
     except AnalysisError:
         raise
     except Exception as e:
@@ -607,7 +775,13 @@ def load_payload(
             timeout = min(timeout, deadline - time.monotonic())
             if timeout <= 1:
                 raise AnalysisError("document time limit reached while rendering")
-        rendered = render_page(page.source_pdf, page.number, dpi, workdir, timeout)
+        rendered = render_page(
+            page.source_pdf,
+            page.number,
+            render_edge(page.long_edge, dpi),
+            workdir,
+            timeout,
+        )
         if rendered.stat().st_size <= MAX_INLINE_BYTES:
             return rendered.read_bytes(), "image/jpeg"
         dpi = max(72, dpi * 2 // 3)

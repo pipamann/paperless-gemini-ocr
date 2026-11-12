@@ -18,6 +18,7 @@ run() { docker compose exec -T webserver python3 /it/run.py "$@"; }
 
 docker compose up -d >/dev/null 2>&1
 IT_LOCAL_OCR=fallback up && run functional | tee results/functional.txt
+[ -n "${ONLY_FUNCTIONAL:-}" ] && { echo "functional phase done"; exit 0; }
 IT_LOCAL_OCR=fallback up && run load --count "$COUNT" --label fallback | tail -16
 IT_LOCAL_OCR=always up && run load --count "$COUNT" --label always | tail -16
 IT_API_KEY= up && run load --count "$COUNT" --label no-plugin | tail -16

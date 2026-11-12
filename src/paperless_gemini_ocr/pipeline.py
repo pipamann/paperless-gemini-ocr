@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from .gemini import GeminiClient
 from .gemini import GeminiError
 from .gemini import PageResult
+from .pages import AnalysisError
 from .pages import load_payload
 
 if TYPE_CHECKING:
@@ -21,6 +22,10 @@ if TYPE_CHECKING:
     from .pages import Page
 
 logger = logging.getLogger("paperless.parsing.gemini_ocr")
+
+# A page with at least this much text of its own (a scanner's text layer) is
+# not believed to be empty just because the model says so.
+_TEXT_LAYER_CHARS = 50
 
 
 @dataclass
@@ -91,7 +96,14 @@ def read_pages(
         if remaining <= 1:
             raise GeminiError("document time limit reached", retryable=False, attempts=0)
         data, mime_type = load_payload(page, cfg, workdir, deadline)
-        return client.transcribe(data, mime_type, prompt, deadline)
+        result = client.transcribe(data, mime_type, prompt, deadline)
+        if not result.text and len(page.embedded_text) >= _TEXT_LAYER_CHARS:
+            raise GeminiError(
+                "the model found no text on a page whose own text layer has some",
+                retryable=False,
+                attempts=result.attempts,
+            )
+        return result
 
     try:
         with ThreadPoolExecutor(
@@ -104,14 +116,18 @@ def read_pages(
                     outcome.results[number] = future.result()
                 except GeminiError as e:
                     outcome.failures[number] = f"{e} after {e.attempts} attempt(s)"
+                except AnalysisError as e:
+                    outcome.failures[number] = str(e)
                 except Exception as e:
                     # Rendering, file access, anything unforeseen: the page
                     # counts as failed, the document still gets imported.
-                    outcome.failures[number] = f"{type(e).__name__}: {e}"
+                    # Only the kind of error is kept; the text of a foreign
+                    # exception goes into the document note otherwise.
+                    outcome.failures[number] = type(e).__name__
     except Exception as e:
         for page in todo:
             if page.number not in outcome.results:
-                outcome.failures.setdefault(page.number, f"{type(e).__name__}: {e}")
+                outcome.failures.setdefault(page.number, type(e).__name__)
     finally:
         if own_client:
             try:

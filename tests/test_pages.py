@@ -490,3 +490,276 @@ def test_rendering_respects_the_document_time_limit(pdf_factory, workdir):
     cfg = Config(api_key="k", page_input="image")
     with pytest.raises(AnalysisError, match="time limit"):
         load_payload(pages[0], cfg, workdir, deadline=time.monotonic() + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Limits added after the multi-model review
+# ---------------------------------------------------------------------------
+
+
+def test_ascii85_cannot_blow_up_while_decoding():
+    from paperless_gemini_ocr.pages import _decode_stage
+
+    limit = 8 * 1024 * 1024
+    # "z" is four zero bytes: small input, large output and a larger work list.
+    assert _decode_stage("/ASCII85Decode", b"z" * (3 * 1024 * 1024), limit) is None
+    assert _decode_stage("/A85", b"z" * (300 * 1024), limit) is None
+    assert _decode_stage("/A85", b"87cURD]i,\"Ebo80~>", limit) == b"Hello World!"
+
+
+def test_unused_form_in_the_resources_keeps_the_page_from_being_exported(tmp_path, workdir):
+    """The clean-up of a page copy would unpack a form the page never paints."""
+    import zlib
+
+    from pikepdf import Array
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    page = pdf.pages[0]
+    form = pikepdf.Stream(pdf, b"")
+    form.write(zlib.compress(b"q Q " * (4 * 1024 * 1024), 9), filter=Name.FlateDecode)
+    form["/Type"] = Name.XObject
+    form["/Subtype"] = Name.Form
+    form["/BBox"] = Array([0, 0, 1, 1])
+    page.obj["/Resources"] = Dictionary(
+        XObject=Dictionary(Im0=_image_xobject(pdf), Unused=form),
+    )
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q\n")
+    path = tmp_path / "unused-form.pdf"
+    pdf.save(path)
+
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert pages[0].reason.startswith("scan")
+    # Rendered by pdftoppm instead of exported with pikepdf.
+    assert pages[0].payload is None
+    data, mime = load_payload(pages[0], CFG, workdir)
+    assert mime == "image/jpeg"
+
+
+def test_small_unused_form_does_not_prevent_the_export(tmp_path, workdir):
+    from pikepdf import Array
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    page = pdf.pages[0]
+    form = pikepdf.Stream(pdf, b"q Q", Type=Name.XObject, Subtype=Name.Form, BBox=Array([0, 0, 1, 1]))
+    page.obj["/Resources"] = Dictionary(
+        XObject=Dictionary(Im0=_image_xobject(pdf), Unused=form),
+    )
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q\n")
+    path = tmp_path / "small-form.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert pages[0].payload is not None
+
+
+def test_rendered_size_does_not_follow_a_huge_page_box(tmp_path, workdir):
+    """A page that claims 1400 inches is rendered at a fixed pixel size."""
+    from paperless_gemini_ocr.pages import render_edge
+
+    assert render_edge(842, 200) == 2339  # A4 at 200 dpi
+    assert render_edge(100_000, 200) == 5000
+    assert render_edge(0, 200) == 2339
+    assert render_edge(20, 200) == 256
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    pdf.pages[0].obj["/MediaBox"] = pikepdf.Array([0, 0, 100_000, 70_000])
+    pdf.pages[0].obj["/Contents"] = pikepdf.Stream(pdf, b"0 0 m 90000 60000 l S\n")
+    path = tmp_path / "huge-box.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, Config(api_key="k", page_input="image"), workdir)
+    assert kinds(pages) == ["gemini"]
+    assert pages[0].long_edge == 100_000
+    data, mime = load_payload(pages[0], Config(api_key="k", page_input="image"), workdir)
+    assert mime == "image/jpeg"
+    import io
+
+    with Image.open(io.BytesIO(data)) as rendered:
+        assert max(rendered.size) == 5000
+
+
+def test_tiff_with_too_many_frames_is_refused(tmp_path, workdir, monkeypatch):
+    from paperless_gemini_ocr import pages as pages_module
+    from paperless_gemini_ocr.pages import AnalysisError
+
+    monkeypatch.setattr(pages_module, "_MAX_FRAMES", 3)
+    frames = [Image.new("1", (20, 20), 1) for _ in range(4)]
+    path = tmp_path / "many.tif"
+    frames[0].save(path, "TIFF", save_all=True, append_images=frames[1:])
+    with pytest.raises(AnalysisError, match="more than 3 frames"):
+        prepare_image(path, "image/tiff", workdir)
+    # Exactly at the limit is fine.
+    frames[0].save(path, "TIFF", save_all=True, append_images=frames[1:3])
+    assert len(prepare_image(path, "image/tiff", workdir)) == 3
+
+
+def test_image_with_too_many_pixels_is_refused(tmp_path, workdir, monkeypatch):
+    from paperless_gemini_ocr import pages as pages_module
+    from paperless_gemini_ocr.pages import AnalysisError
+
+    monkeypatch.setattr(pages_module, "_MAX_FRAME_PIXELS", 10_000)
+    path = tmp_path / "big.tif"
+    Image.new("1", (200, 200), 1).save(path, "TIFF")
+    with pytest.raises(AnalysisError, match="too many pixels"):
+        prepare_image(path, "image/tiff", workdir)
+
+
+def test_large_frame_is_halved_before_conversion(tmp_path, workdir, monkeypatch):
+    from paperless_gemini_ocr import pages as pages_module
+
+    monkeypatch.setattr(pages_module, "_WORK_PIXELS", 10_000)
+    path = tmp_path / "fax.tif"
+    Image.new("1", (200, 150), 1).save(path, "TIFF", dpi=(300, 300))
+    pages = prepare_image(path, "image/tiff", workdir)
+    with Image.open(pages[0].payload) as frame:
+        assert frame.size == (100, 75)
+        assert frame.info["dpi"] == (150, 150)
+
+
+def test_transparent_areas_become_white(tmp_path, workdir):
+    """Black text on a transparent black background must not turn black on black."""
+    image = Image.new("RGBA", (60, 80), (0, 0, 0, 0))
+    for x in range(20, 40):
+        image.putpixel((x, 40), (0, 0, 0, 255))
+    path = tmp_path / "transparent.tif"
+    image.save(path, "TIFF")
+    pages = prepare_image(path, "image/tiff", workdir)
+    with Image.open(pages[0].payload) as frame:
+        assert frame.getpixel((5, 5))[0] > 240
+        assert frame.getpixel((30, 40))[0] < 60
+
+
+def test_converted_image_is_shown_as_its_orientation_tag_says(tmp_path, workdir):
+    """img2pdf turns the archive page by the tag; the model must see the same."""
+    image = Image.new("RGB", (60, 80), "white")
+    for x in range(30):
+        for y in range(10):
+            image.putpixel((x, y), (0, 0, 0))  # mark the top left corner
+    path = tmp_path / "tagged.tif"
+    image.save(path, "TIFF", tiffinfo={274: 3})  # shown turned by 180 degrees
+    pages = prepare_image(path, "image/tiff", workdir)
+    with Image.open(pages[0].payload) as frame:
+        assert frame.size == (60, 80)
+        assert frame.getpixel((2, 2))[0] > 200
+        assert frame.getpixel((57, 77))[0] < 60
+
+
+def test_jpeg_orientation_tag_is_applied_when_the_image_is_converted():
+    """Pillow leaves JPEG pixels as stored, so the plugin turns them itself."""
+    import io
+
+    from paperless_gemini_ocr.pages import _upright_rgb
+
+    image = Image.new("RGB", (60, 80), "white")
+    for x in range(30):
+        for y in range(10):
+            image.putpixel((x, y), (0, 0, 0))
+    exif = Image.Exif()
+    exif[0x0112] = 6  # shown turned a quarter clockwise
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=95, exif=exif)
+    buffer.seek(0)
+    with Image.open(buffer) as stored:
+        shown = _upright_rgb(stored)
+    assert shown.size == (80, 60)
+    # The mark from the top left corner is now at the top right.
+    assert shown.getpixel((77, 2))[0] < 60
+    assert shown.getpixel((2, 2))[0] > 200
+
+
+def test_frame_resolution_is_kept_for_local_ocr(tmp_path, workdir):
+    path = tmp_path / "scan.tif"
+    Image.new("L", (60, 80), 255).save(path, "TIFF", dpi=(300, 300))
+    pages = prepare_image(path, "image/tiff", workdir)
+    with Image.open(pages[0].payload) as frame:
+        assert frame.info["dpi"] == (300, 300)
+
+
+def test_mirrored_orientation_tags_are_left_alone():
+    """img2pdf ignores them for the archive, so the model sees the stored pixels too."""
+    import io
+
+    from paperless_gemini_ocr.pages import _upright_rgb
+
+    image = Image.new("RGB", (60, 80), "white")
+    for x in range(30):
+        for y in range(10):
+            image.putpixel((x, y), (0, 0, 0))
+    exif = Image.Exif()
+    exif[0x0112] = 4  # mirrored top to bottom
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=95, exif=exif)
+    buffer.seek(0)
+    with Image.open(buffer) as stored:
+        shown = _upright_rgb(stored)
+    assert shown.getpixel((2, 2))[0] < 60
+
+
+def test_form_listed_under_many_names_is_charged_every_time(tmp_path, workdir):
+    """The clean-up parses a form once per name, so the budget counts it that often."""
+    import zlib
+
+    from pikepdf import Array
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    page = pdf.pages[0]
+    form = pikepdf.Stream(pdf, b"")
+    form.write(zlib.compress(b"q Q " * 25_000, 9), filter=Name.FlateDecode)  # 100 kB
+    form["/Type"] = Name.XObject
+    form["/Subtype"] = Name.Form
+    form["/BBox"] = Array([0, 0, 1, 1])
+    xobjects = Dictionary(Im0=_image_xobject(pdf))
+    for index in range(200):  # 200 x 100 kB is past the 8 MiB budget
+        xobjects[f"/Alias{index}"] = form
+    page.obj["/Resources"] = Dictionary(XObject=xobjects)
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q\n")
+    path = tmp_path / "aliases.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert pages[0].payload is None
+
+
+def test_forms_sharing_the_page_resources_can_still_be_exported(tmp_path, workdir):
+    """A form whose resources are the page's own dictionary is no endless loop."""
+    from pikepdf import Array
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    page = pdf.pages[0]
+    resources = pdf.make_indirect(Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf))))
+    form = pikepdf.Stream(
+        pdf,
+        b"q 1 0 0 1 0 0 cm /Im0 Do Q",
+        Type=Name.XObject,
+        Subtype=Name.Form,
+        BBox=Array([0, 0, 1, 1]),
+        Resources=resources,
+    )
+    resources["/XObject"]["/Fm0"] = form
+    page.obj["/Resources"] = resources
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q\n")
+    path = tmp_path / "shared-resources.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert pages[0].payload is not None

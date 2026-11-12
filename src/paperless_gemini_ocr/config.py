@@ -7,9 +7,13 @@ container restart pick up changes without any caching surprises.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
+
+logger = logging.getLogger("paperless.parsing.gemini_ocr")
 
 PREFIX = "PAPERLESS_GEMINI_OCR_"
 
@@ -59,16 +63,27 @@ def _read_api_key() -> str | None:
         return key
     key_file = _get("API_KEY_FILE")
     if key_file:
+        # Said out loud: without a key the plugin stands aside and every
+        # document is read by the built-in parser, which looks like success.
         try:
-            return Path(key_file).read_text(encoding="utf-8").strip() or None
-        except OSError:
+            key = Path(key_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as e:
+            logger.warning(
+                "Gemini OCR is inactive: API key file %s is not readable (%s)",
+                key_file,
+                type(e).__name__,
+            )
             return None
+        if not key:
+            logger.warning("Gemini OCR is inactive: API key file %s is empty", key_file)
+            return None
+        return key
     return None
 
 
 @dataclass(frozen=True)
 class Config:
-    api_key: str | None = None
+    api_key: str | None = field(default=None, repr=False)
     model: str = "gemini-3.8-flash"
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
 

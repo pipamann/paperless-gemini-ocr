@@ -159,10 +159,18 @@ class StubTesseractParser:
     calls: list[str] = []
     fail_modes: set[str] = set()
     configured_mode: str = _ModeChoices.AUTO
+    # PAPERLESS_OCR_ROTATE_PAGES, on by default in Paperless.
+    configured_rotate: bool = True
+    configured_user_args: dict | None = None
+    parsed: list[tuple[str, str]] = []
 
     def __init__(self) -> None:
         self.tempdir = Path(tempfile.mkdtemp(prefix="stub-parser-"))
-        self.settings = SimpleNamespace(mode=type(self).configured_mode)
+        self.settings = SimpleNamespace(
+            mode=type(self).configured_mode,
+            rotate=type(self).configured_rotate,
+            user_args=type(self).configured_user_args,
+        )
         self.text: str | None = None
         self.archive_path: Path | None = None
         self.log = logging.getLogger("stub")
@@ -183,9 +191,12 @@ class StubTesseractParser:
     def parse(self, document_path, mime_type, *, produce_archive=True) -> None:
         mode = self.settings.mode
         type(self).calls.append(mode)
+        type(self).parsed.append((mode, Path(document_path).name))
         if mode in type(self).fail_modes:
             raise ParseError(f"stub failure in mode {mode}")
         self.text = f"local text ({mode})"
+        if mode == _ModeChoices.FORCE and Path(document_path).name.startswith("frame-"):
+            self.text = f"tesseract text of {Path(document_path).name}"
         internal = self.tempdir / "archive.pdf"
         if mode == _ModeChoices.FORCE:
             # OCR ran: an output PDF with a recognised text layer per page.
@@ -239,6 +250,9 @@ def stub_parser():
     StubTesseractParser.calls = []
     StubTesseractParser.fail_modes = set()
     StubTesseractParser.configured_mode = _ModeChoices.AUTO
+    StubTesseractParser.configured_rotate = True
+    StubTesseractParser.configured_user_args = None
+    StubTesseractParser.parsed = []
     return StubTesseractParser
 
 

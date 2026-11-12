@@ -114,3 +114,19 @@ def test_no_work_starts_after_the_document_time_limit(pdf_factory, workdir):
     assert client.calls == 0
     assert sorted(outcome.failures) == [1, 2]
     assert "time limit" in outcome.failures[1]
+
+
+def test_empty_answer_is_not_believed_when_the_page_has_a_text_layer(pdf_factory, workdir):
+    """A scan whose scanner found text cannot be an empty page."""
+    text = "Invoice 12345 of 12 November, total 99.50 EUR net, payable within 14 days"
+    pages = analyse_pdf(pdf_factory(["scan_text", "scan"], text=text), CFG, workdir)
+    client = FakeClient({"default": PageResult(text="", rotation=0)})
+    outcome = read_pages(pages, Config(api_key="k", concurrency=1), workdir, client)
+    assert sorted(outcome.results) == [2]
+    assert "no text" in outcome.failures[1]
+
+
+def test_foreign_exception_text_stays_out_of_the_failures(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["scan"]), CFG, workdir)
+    outcome = read_pages(pages, CFG, workdir, FakeClient({"default": RuntimeError("secret")}))
+    assert outcome.failures == {1: "RuntimeError"}

@@ -27,6 +27,8 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
   text: the document stays as it was and Paperless logs the error.
 - Pages the model reports as upside down are turned upright in the archive
   PDF. The original file is never modified.
+- A page the model calls empty although its own text layer has text counts as
+  failed, so a scanner's text is not thrown away on the model's word.
 
 Archive PDF, thumbnail, page count and metadata come from the built-in
 Tesseract parser, which this plugin extends.
@@ -43,17 +45,24 @@ marks for remote OCR are sent; everything else is processed locally.
 
 1. Download the wheel from the releases page into a folder next to your
    `docker-compose.yml`, for example `./gemini-ocr/`.
-2. Put an install script into the same folder, `./gemini-ocr/install.sh`, and
-   make it executable (`chmod +x`):
+2. Put an install script into the same folder, `./gemini-ocr/install.sh`:
 
    ```bash
    #!/bin/bash
    set -e
-   pip install --no-index --no-deps /opt/gemini-ocr/paperless_gemini_ocr-*.whl
+   wheel=$(ls /opt/gemini-ocr/paperless_gemini_ocr-*.whl 2>/dev/null | sort -V | tail -n 1)
+   if [ -z "$wheel" ]; then
+       echo "gemini-ocr: no wheel in /opt/gemini-ocr, the plugin is NOT installed" >&2
+       exit 1
+   fi
+   pip install --no-index --no-deps --force-reinstall "$wheel"
    ```
 
-   The plugin only needs libraries Paperless-ngx already ships, so nothing is
-   downloaded when the container starts.
+   The script must belong to root and must not be writable by others
+   (`sudo chown root:root install.sh && sudo chmod 755 install.sh`).
+   Paperless skips all custom init scripts otherwise and starts without the
+   plugin. The plugin only needs libraries Paperless-ngx already ships, so
+   nothing is downloaded when the container starts.
 3. Mount both and set the API key. Paperless runs every file it finds in
    `/custom-cont-init.d`, so only the script goes there:
 
@@ -72,6 +81,10 @@ marks for remote OCR are sent; everything else is processed locally.
    ```
    Loaded third-party parser 'Gemini OCR' v0.1.0 by pipamann (entrypoint: 'gemini_ocr').
    ```
+
+   If the line is missing, the plugin is not installed and every document is
+   read by Tesseract as before; the container log then says why
+   (`[custom-init]` lines).
 
 Without an API key the plugin stays inactive and Paperless behaves as before.
 To remove it, delete the two mounts and recreate the container.
@@ -106,7 +119,17 @@ All variables are optional except the API key.
 With `fallback`, a scan's archive PDF has no text layer: Paperless' search
 works on the model's text, but searching inside the downloaded PDF does not.
 In exchange Tesseract, usually the slowest step of an import, is skipped.
-With `always` you keep the text layer and the old import time.
+With `always` you keep the text layer and the old import time. Turning pages
+is then left to OCRmyPDF (`PAPERLESS_OCR_ROTATE_PAGES`, on by default); the
+model's finding is only used when that setting is off.
+
+### Limits
+
+Files far outside what a scanner produces are not sent to the model, or only
+in reduced form: a rendered page has at most 5000 pixels on its longer edge,
+an image with more than 120 megapixels or a TIFF with more than 2000 frames
+is imported with local OCR only and tagged, and a PDF page whose content
+needs unusual effort to analyse is rendered instead of being taken apart.
 
 ## Development
 

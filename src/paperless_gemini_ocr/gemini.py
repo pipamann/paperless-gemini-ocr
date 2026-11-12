@@ -9,10 +9,12 @@ callers decide what to do with a page that could not be read.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import random
 import re
 import time
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -40,6 +42,15 @@ _ROTATION_LINE = re.compile(r"^\s*`?\s*ROTATION:\s*(\d{1,3})\s*°?\s*`?\s*$", re
 _FENCE = re.compile(r"^```[\w-]*\n(.*)\n```$", re.DOTALL)
 _RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 _THINKING_LEVELS = frozenset({"minimal", "low", "medium", "high"})
+# Status words of the API end up in logs and document notes. Only plain ones
+# are passed on, so nothing a broken endpoint echoes can travel that way.
+_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,39}$")
+# One page of text is a few kilobytes; anything near this is not an answer.
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+
+def _code(value: object) -> str:
+    return value if isinstance(value, str) and _CODE.match(value) else "UNKNOWN"
 
 
 class GeminiError(Exception):
@@ -107,11 +118,19 @@ def split_rotation(text: str) -> tuple[int | None, str]:
     return (degrees if degrees in (0, 90, 180, 270) else None), rest
 
 
-def parse_response(payload: dict) -> PageResult:
+def parse_response(payload: object) -> PageResult:
+    try:
+        return _parse_response(payload)
+    except (AttributeError, TypeError, KeyError, IndexError, ValueError) as e:
+        # Valid JSON of another shape, e.g. from a gateway in front of the API.
+        raise GeminiError("answer has an unexpected structure", retryable=True) from e
+
+
+def _parse_response(payload: dict) -> PageResult:
     feedback = payload.get("promptFeedback") or {}
     if feedback.get("blockReason"):
         raise GeminiError(
-            f"request blocked ({feedback['blockReason']})",
+            f"request blocked ({_code(feedback['blockReason'])})",
             retryable=False,
         )
     candidates = payload.get("candidates") or []
@@ -122,7 +141,7 @@ def parse_response(payload: dict) -> PageResult:
     if finish not in (None, "STOP"):
         # MAX_TOKENS on a single page means the model looped or thought the
         # budget away; SAFETY and RECITATION are not deterministic either.
-        raise GeminiError(f"answer ended with {finish}", retryable=True)
+        raise GeminiError(f"answer ended with {_code(finish)}", retryable=True)
     parts = (candidate.get("content") or {}).get("parts") or []
     raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not raw.strip():
@@ -141,15 +160,18 @@ def parse_response(payload: dict) -> PageResult:
     )
 
 
-def _http_error(response: httpx.Response) -> GeminiError:
+def _http_error(status_code: int, raw: bytes) -> GeminiError:
     status = ""
     try:
-        status = str((response.json().get("error") or {}).get("status") or "")
+        body = json.loads(raw)
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("status") is not None:
+            status = _code(error["status"])
     except ValueError:
         pass
     return GeminiError(
-        f"HTTP {response.status_code} {status}".strip(),
-        retryable=response.status_code in _RETRY_STATUS,
+        f"HTTP {status_code} {status}".strip(),
+        retryable=status_code in _RETRY_STATUS,
     )
 
 
@@ -185,6 +207,51 @@ class GeminiClient:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _post(self, url: str, headers: dict, body: dict, timeout: float) -> tuple[int, bytes]:
+        """Send one request; the whole exchange gets ``timeout`` seconds.
+
+        httpx applies its timeout to every single read, so an endpoint that
+        keeps sending a few bytes would never run into it. The answer is
+        therefore read in pieces, with a look at the clock in between.
+        """
+        give_up_at = self._clock() + timeout
+        chunks: list[bytes] = []
+        size = 0
+        with self._http.stream(
+            "POST",
+            url,
+            headers=headers,
+            json=body,
+            timeout=timeout,
+        ) as response:
+            # The bytes are taken as they come off the wire. httpx would
+            # unpack a compressed answer without any limit and without
+            # handing anything over while it does, so that is done here.
+            encoding = response.headers.get("content-encoding", "").strip().lower()
+            if encoding in ("", "identity"):
+                inflater = None
+            elif encoding in ("gzip", "x-gzip", "deflate"):
+                inflater = zlib.decompressobj(47)
+            else:
+                raise GeminiError("answer in an unexpected encoding", retryable=False)
+            for chunk in response.iter_raw():
+                if self._clock() > give_up_at:
+                    raise httpx.ReadTimeout("time for the request used up")
+                while chunk:
+                    if inflater is None:
+                        piece, chunk = chunk, b""
+                    else:
+                        try:
+                            piece = inflater.decompress(chunk, _MAX_RESPONSE_BYTES - size + 1)
+                        except zlib.error as e:
+                            raise GeminiError("answer cannot be unpacked", retryable=True) from e
+                        chunk = inflater.unconsumed_tail
+                    size += len(piece)
+                    if size > _MAX_RESPONSE_BYTES:
+                        raise GeminiError("answer too large", retryable=False)
+                    chunks.append(piece)
+            return response.status_code, b"".join(chunks)
+
     def transcribe(
         self,
         data: bytes,
@@ -195,7 +262,7 @@ class GeminiClient:
         """Read one page. ``deadline`` is a ``clock()`` value for the whole document."""
         cfg = self.cfg
         url = f"{cfg.base_url}/models/{cfg.model}:generateContent"
-        headers = {"x-goog-api-key": cfg.api_key or ""}
+        headers = {"x-goog-api-key": cfg.api_key or "", "accept-encoding": "identity"}
         body = build_request(cfg, data, mime_type, prompt)
         started = self._clock()
         error = GeminiError("not attempted", retryable=False)
@@ -212,15 +279,10 @@ class GeminiClient:
                     )
                 timeout = min(timeout, remaining)
             try:
-                response = self._http.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=timeout,
-                )
-                if response.status_code != 200:
-                    raise _http_error(response)
-                result = parse_response(response.json())
+                status_code, raw = self._post(url, headers, body, timeout)
+                if status_code != 200:
+                    raise _http_error(status_code, raw)
+                result = parse_response(json.loads(raw))
                 result.attempts = attempt
                 result.seconds = self._clock() - started
                 return result

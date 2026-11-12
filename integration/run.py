@@ -68,6 +68,21 @@ def jpeg(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def tiff(images: list[Image.Image]) -> bytes:
+    """A multi-page TIFF, as a fax server or some scanners write it."""
+    buffer = io.BytesIO()
+    frames = [image.convert("L") for image in images]
+    frames[0].save(
+        buffer,
+        "TIFF",
+        save_all=True,
+        append_images=frames[1:],
+        compression="tiff_deflate",
+        dpi=(150, 150),
+    )
+    return buffer.getvalue()
+
+
 def scan_pdf(images: list[Image.Image]) -> bytes:
     buffer = io.BytesIO()
     images[0].save(buffer, "PDF", save_all=True, append_images=images[1:], resolution=150)
@@ -339,6 +354,49 @@ def functional() -> None:
     control(mode="empty")
     doc = document(consume("empty", "jpg", jpeg(page_image(letter(uid()))))["id"])
     check("empty answers: local OCR and flag", "Musterfirma" in doc["content"] and review_tag_id() in doc["tags"], doc["content"][:120])
+
+    # --- multi-page TIFF: one request per frame
+    control(mode="ok")
+    doc = document(consume("tiff", "tif", tiff([page_image(letter(uid())) for _ in range(3)]))["id"])
+    seen = stats()
+    check("tiff: three frames read", doc["content"].count("FAKE-OCR request") == 3, doc["content"])
+    check("tiff: frames sent as images", seen["mimes"] == ["image/jpeg"] * 3, seen)
+
+    # --- multi-page TIFF, model down: every frame read locally, once, in order
+    control(mode="fail")
+    # Words, not random numbers: Tesseract misreads about one number in ten
+    # (a blank inside, O for 0), whatever the file type.
+    marks = ["Adler", "Biber", "Dachs"]
+    doc = document(consume("tiff-down", "tif", tiff([page_image(letter(m)) for m in marks]))["id"])
+    content = doc["content"]
+    places = [content.find(m) for m in marks]
+    check("model down, tiff: all frames read by local OCR", all(p >= 0 for p in places), content[:300])
+    check("model down, tiff: frames in order", places == sorted(places), places)
+    check("model down, tiff: no frame twice", all(content.count(m) == 1 for m in marks), [content.count(m) for m in marks])
+    check("model down, tiff: flagged", review_tag_id() in doc["tags"], doc["tags"])
+
+    # --- upside-down scan PDF: the archive is turned there too
+    control(mode="ok", rotation=180)
+    doc = document(consume("upside-down-pdf", "pdf", scan_pdf([page_image(letter(uid())) for _ in range(2)]))["id"])
+    check("upside-down pdf: archive pages turned by 180", archive_rotation(doc["id"]) == [180, 180], archive_rotation(doc["id"]))
+
+    # --- a page the model calls empty: believed for a plain image ...
+    control(mode="blank")
+    doc = document(consume("blank", "jpg", jpeg(page_image([])))["id"])
+    check("blank page: imported without text and without flag", doc["content"].strip() == "" and review_tag_id() not in doc["tags"], doc["content"][:80])
+
+    # ... but not for a scan whose own text layer has text
+    control(mode="blank")
+    marker = uid()
+    doc = document(consume("blank-layer", "pdf", scanner_pdf(letter(marker)))["id"])
+    check("blank answer, scanner layer: text kept", "Musterfirma" in doc["content"], doc["content"][:200])
+    check("blank answer, scanner layer: flagged", review_tag_id() in doc["tags"], doc["tags"])
+
+    # --- error answers of another shape are retried like any other failure
+    control(mode="garbage")
+    doc = document(consume("garbage", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    check("odd error body: three attempts", stats()["requests"] == 3, stats())
+    check("odd error body: local OCR and flag", "Musterfirma" in doc["content"] and review_tag_id() in doc["tags"], doc["content"][:120])
 
     # --- reprocess: a failure leaves the content alone, a success replaces it
     before = document(jpg_doc_id)["content"]

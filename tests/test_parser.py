@@ -387,3 +387,76 @@ def test_always_mode_still_forces_ocr_for_failed_pdf_pages(configured, monkeypat
     parser = consume(pdf_factory(["text", "scan_text"]))
     assert configured.calls == ["auto", "force"]
     assert parser.get_text() == "Invoice 12345 total 99.50 EUR net\n\nlocal text (force)"
+
+
+def test_model_rotation_applies_when_local_ocr_does_not_turn_pages(
+    configured,
+    monkeypatch,
+    pdf_factory,
+):
+    """LOCAL_OCR=always with PAPERLESS_OCR_ROTATE_PAGES off: nobody else turns the page."""
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_LOCAL_OCR", "always")
+    configured.configured_rotate = False
+    model_answers(monkeypatch, results={1: PageResult(text="a", rotation=180)})
+    parser = consume(pdf_factory(["scan"]))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert archive.pages[0].obj["/Rotate"] == 180
+
+
+def tiff_with_frames(path, count):
+    frames = [Image.new("RGB", (60, 80), "white") for _ in range(count)]
+    frames[0].save(path, "TIFF", save_all=True, append_images=frames[1:])
+    return path
+
+
+def test_failed_tiff_frame_gets_its_own_ocr_text(configured, monkeypatch, tmp_path):
+    """Only the failed frame is read locally; the others keep the model's text, in order."""
+    model_answers(
+        monkeypatch,
+        results={
+            1: PageResult(text="eins", rotation=0),
+            3: PageResult(text="drei", rotation=0),
+        },
+        failures={2: "timeout"},
+    )
+    parser = consume(tiff_with_frames(tmp_path / "fax.tif", 3), "image/tiff")
+    assert parser.get_text() == "eins\n\ntesseract text of frame-00002.jpg\n\ndrei"
+    assert [name for mode, name in configured.parsed if mode == "force"] == ["frame-00002.jpg"]
+
+
+def test_several_failed_tiff_frames_keep_their_places(configured, monkeypatch, tmp_path):
+    model_answers(
+        monkeypatch,
+        results={2: PageResult(text="zwei", rotation=0)},
+        failures={1: "timeout", 3: "timeout"},
+    )
+    parser = consume(tiff_with_frames(tmp_path / "fax.tif", 3), "image/tiff")
+    assert parser.get_text() == (
+        "tesseract text of frame-00001.jpg\n\nzwei\n\ntesseract text of frame-00003.jpg"
+    )
+
+
+def test_foreign_exception_text_stays_out_of_the_report(configured, monkeypatch, tmp_path):
+    """Only the kind of an unexpected error is kept, not what it says."""
+
+    def explode(path, cfg, workdir):
+        raise RuntimeError("secret detail from a library")
+
+    monkeypatch.setattr(plugin, "analyse_pdf", explode)
+    path = tmp_path / "doc.pdf"
+    path.write_bytes(b"%PDF-1.4")
+    consume(path)
+    report = state.pop_report()
+    assert report.document_error == "RuntimeError"
+    assert "secret" not in report.note()
+
+
+def test_rotation_setting_from_user_args_counts(configured, monkeypatch, pdf_factory):
+    """PAPERLESS_OCR_USER_ARGS can switch OCRmyPDF's rotation on over the regular setting."""
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_LOCAL_OCR", "always")
+    configured.configured_rotate = False
+    configured.configured_user_args = {"rotate_pages": True}
+    model_answers(monkeypatch, results={1: PageResult(text="a", rotation=180)})
+    parser = consume(pdf_factory(["scan"]))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert "/Rotate" not in archive.pages[0].obj

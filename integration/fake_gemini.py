@@ -1,6 +1,6 @@
 """Stand-in for the Gemini API, steerable over HTTP.
 
-GET /control?mode=ok|fail|flaky|empty&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
+GET /control?mode=ok|fail|flaky|empty|blank|garbage&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
     sets the behaviour and resets the counters.
 GET /stats returns what was requested since.
 """
@@ -75,6 +75,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, {"error": {"status": "UNAVAILABLE"}})
             elif state["mode"] == "empty":
                 self._json(200, {"candidates": []})
+            elif state["mode"] == "garbage":
+                # Valid JSON, but not the shape of an API error.
+                self._json(503, [{"error": "upstream"}])
+            elif state["mode"] == "blank":
+                # A well-formed answer for a page without any text.
+                self._json(
+                    200,
+                    {
+                        "candidates": [
+                            {"content": {"parts": [{"text": "ROTATION: 0"}]}, "finishReason": "STOP"},
+                        ],
+                    },
+                )
             else:
                 text = (
                     f"ROTATION: {state['rotation']}\n"
