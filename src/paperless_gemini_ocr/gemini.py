@@ -127,10 +127,13 @@ def parse_response(payload: dict) -> PageResult:
     raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not raw.strip():
         raise GeminiError("empty answer", retryable=True)
-    rotation, text = split_rotation(raw)
+    rotation, text = split_rotation(raw.replace("\x00", ""))
+    if not text and rotation is None:
+        # An empty page is only believed when the answer follows the protocol.
+        raise GeminiError("answer without text and without a valid rotation line", retryable=True)
     usage = payload.get("usageMetadata") or {}
     return PageResult(
-        text=text.replace("\x00", ""),
+        text=text,
         rotation=rotation,
         input_tokens=int(usage.get("promptTokenCount") or 0),
         output_tokens=int(usage.get("candidatesTokenCount") or 0),

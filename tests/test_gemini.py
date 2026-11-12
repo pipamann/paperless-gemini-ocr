@@ -181,3 +181,12 @@ def test_error_text_never_contains_the_key():
     with pytest.raises(GeminiError) as caught:
         client.transcribe(b"data", "image/jpeg", "prompt")
     assert "secret-key" not in str(caught.value)
+
+
+@pytest.mark.parametrize("raw", ["ROTATION: 45", "\x00\x00", "ROTATION: 45\n\x00"])
+def test_empty_text_needs_a_valid_protocol_line(raw):
+    """Otherwise a garbled answer would pass as a blank page and wipe the content."""
+    client, requests, _ = client_for([(200, answer(raw))] * 3)
+    with pytest.raises(GeminiError, match="without text"):
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert len(requests) == 3

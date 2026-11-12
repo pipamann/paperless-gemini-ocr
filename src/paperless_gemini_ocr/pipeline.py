@@ -50,7 +50,7 @@ def load_prompt(cfg: Config) -> str:
             if text:
                 return text
             logger.warning("Prompt file %s is empty, using the built-in prompt", cfg.prompt_file)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             logger.warning(
                 "Prompt file %s not readable (%s), using the built-in prompt",
                 cfg.prompt_file,
@@ -65,20 +65,32 @@ def read_pages(
     workdir: Path,
     client: GeminiClient | None = None,
 ) -> DocumentResult:
-    """Send every page of kind "gemini" to the model. Never raises for a page."""
+    """Send every page of kind "gemini" to the model.
+
+    Never raises: whatever goes wrong, for one page or for all of them, ends
+    up in ``failures``.
+    """
     todo = [p for p in pages if p.kind == "gemini"]
     outcome = DocumentResult()
     if not todo:
         return outcome
 
-    prompt = load_prompt(cfg)
     started = time.monotonic()
     deadline = started + cfg.document_timeout
     own_client = client is None
-    client = client or GeminiClient(cfg)
+    try:
+        prompt = load_prompt(cfg)
+        client = client or GeminiClient(cfg)
+    except Exception as e:
+        for page in todo:
+            outcome.failures[page.number] = f"setup failed ({type(e).__name__})"
+        return outcome
 
     def read(page: Page) -> PageResult:
-        data, mime_type = load_payload(page, cfg, workdir)
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            raise GeminiError("document time limit reached", retryable=False, attempts=0)
+        data, mime_type = load_payload(page, cfg, workdir, timeout=remaining)
         return client.transcribe(data, mime_type, prompt, deadline)
 
     try:
@@ -96,9 +108,16 @@ def read_pages(
                     # Rendering, file access, anything unforeseen: the page
                     # counts as failed, the document still gets imported.
                     outcome.failures[number] = f"{type(e).__name__}: {e}"
+    except Exception as e:
+        for page in todo:
+            if page.number not in outcome.results:
+                outcome.failures.setdefault(page.number, f"{type(e).__name__}: {e}")
     finally:
         if own_client:
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
     outcome.seconds = time.monotonic() - started
     return outcome
 

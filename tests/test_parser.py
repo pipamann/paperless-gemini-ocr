@@ -130,26 +130,74 @@ def test_failed_page_falls_back_to_local_ocr_and_is_reported(configured, monkeyp
         results={1: PageResult(text="gut gelesen", rotation=0)},
         failures={2: "HTTP 503 after 3 attempt(s)"},
     )
-    parser = consume(pdf_factory(["scan", "scan_text"]))
-    # First the OCR-free run, then the full run for the failed page.
-    assert configured.calls == ["off", "auto"]
-    assert parser.get_text() == "gut gelesen\n\nInvoice 12345 total 99.50 EUR net"
+    parser = consume(pdf_factory(["scan", "scan"]))
+    # First the OCR-free run, then forced OCR for the failed page only.
+    assert configured.calls == ["off", "force"]
+    assert parser.get_text() == "gut gelesen\n\nlocal text (force)"
+    assert parser.settings.mode == "auto"
+    # The archive of the import itself is still there and is the OCR-free one.
+    with pikepdf.open(parser.archive_path) as archive:
+        assert len(archive.pages) == 2
     report = state.pop_report()
     assert report.failures == {2: "HTTP 503 after 3 attempt(s)"}
     assert "page(s) 2 of 2" in report.note()
 
 
+def test_several_failed_pages_get_their_own_ocr_text(configured, monkeypatch, pdf_factory):
+    model_answers(
+        monkeypatch,
+        results={2: PageResult(text="Seite zwei vom Modell", rotation=0)},
+        failures={1: "timeout", 3: "timeout"},
+    )
+    parser = consume(pdf_factory(["scan", "scan", "scan"]))
+    assert configured.calls == ["off", "force"]
+    assert parser.get_text() == (
+        "tesseract text of page 1 in this file\n\n"
+        "Seite zwei vom Modell\n\n"
+        "tesseract text of page 2 in this file"
+    )
+
+
+def test_fallback_ocr_runs_even_when_no_archive_is_wanted(configured, monkeypatch, pdf_factory):
+    """Paperless calls a scan with a scanner text layer born-digital: no archive."""
+    model_answers(monkeypatch, failures={1: "timeout", 2: "timeout"})
+    parser = consume(pdf_factory(["scan_text", "scan_text"]), produce_archive=False)
+    assert configured.calls == ["off", "force"]
+    assert parser.get_text() == (
+        "tesseract text of page 1 in this file\n\ntesseract text of page 2 in this file"
+    )
+    assert parser.archive_path is None
+    assert not (parser.tempdir / "archive.pdf").exists()
+
+
 def test_import_survives_when_fallback_ocr_fails_too(configured, monkeypatch, pdf_factory):
-    configured.fail_modes = {"auto"}
+    configured.fail_modes = {"force"}
     model_answers(
         monkeypatch,
         results={1: PageResult(text="gut gelesen", rotation=0)},
         failures={2: "timeout"},
     )
     parser = consume(pdf_factory(["scan", "scan"]))
-    assert configured.calls == ["off", "auto"]
+    assert configured.calls == ["off", "force"]
     assert parser.get_text() == "gut gelesen"
     assert parser.archive_path.is_file()
+    assert parser.settings.mode == "auto"
+    assert state.pop_report() is not None
+
+
+def test_scanner_text_layer_is_used_when_ocr_yields_nothing(configured, monkeypatch, pdf_factory):
+    configured.fail_modes = {"force"}
+    model_answers(monkeypatch, failures={1: "timeout"})
+    parser = consume(pdf_factory(["scan_text"]))
+    assert parser.get_text() == "Invoice 12345 total 99.50 EUR net"
+
+
+def test_no_fallback_ocr_when_ocr_is_switched_off(configured, monkeypatch, pdf_factory):
+    configured.configured_mode = "off"
+    model_answers(monkeypatch, failures={1: "timeout"})
+    parser = consume(pdf_factory(["scan_text"]))
+    assert configured.calls == ["off"]
+    assert parser.get_text() == "Invoice 12345 total 99.50 EUR net"
     assert state.pop_report() is not None
 
 
@@ -158,9 +206,32 @@ def test_single_image_failure_uses_local_text(configured, monkeypatch, tmp_path)
     Image.new("RGB", (60, 80), "white").save(path, "JPEG")
     model_answers(monkeypatch, failures={1: "empty answer after 3 attempt(s)"})
     parser = consume(path, "image/jpeg")
-    assert configured.calls == ["off", "auto"]
-    assert parser.get_text() == "local text (auto)"
+    assert configured.calls == ["off", "force"]
+    assert parser.get_text() == "local text (force)"
+    assert parser.archive_path.is_file()
     assert state.pop_report().failures == {1: "empty answer after 3 attempt(s)"}
+
+
+def test_crash_in_the_model_run_counts_as_all_pages_failed(configured, monkeypatch, pdf_factory):
+    def explode(pages, cfg, workdir, client=None):
+        raise RuntimeError("thread pool gone")
+
+    monkeypatch.setattr(plugin, "read_pages", explode)
+    parser = consume(pdf_factory(["scan", "scan"]))
+    assert parser.get_text() == (
+        "tesseract text of page 1 in this file\n\ntesseract text of page 2 in this file"
+    )
+    assert sorted(state.pop_report().failures) == [1, 2]
+
+
+def test_no_second_rotation_when_ocrmypdf_made_the_archive(configured, monkeypatch, pdf_factory):
+    """The OCR-free run failed, the normal one produced the archive and turns pages itself."""
+    configured.fail_modes = {"off"}
+    model_answers(monkeypatch, results={1: PageResult(text="a", rotation=180)})
+    parser = consume(pdf_factory(["scan"]))
+    assert configured.calls == ["off", "auto"]
+    with pikepdf.open(parser.archive_path) as archive:
+        assert "/Rotate" not in archive.pages[0].obj
 
 
 def test_ocr_free_run_failing_retries_with_ocr(configured, monkeypatch, pdf_factory):

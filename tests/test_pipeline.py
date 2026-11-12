@@ -85,3 +85,32 @@ def test_missing_prompt_file_falls_back_to_builtin(tmp_path):
     builtin = load_prompt(Config())
     assert "faithful OCR transcription" in builtin
     assert load_prompt(Config(prompt_file=str(tmp_path / "missing.txt"))) == builtin
+
+
+def test_setup_failure_counts_as_all_pages_failed(pdf_factory, workdir, monkeypatch):
+    from paperless_gemini_ocr import pipeline
+
+    def broken(cfg):
+        raise RuntimeError("no certificates")
+
+    monkeypatch.setattr(pipeline, "GeminiClient", broken)
+    pages = analyse_pdf(pdf_factory(["scan", "text", "scan"]), CFG, workdir)
+    outcome = read_pages(pages, CFG, workdir)
+    assert outcome.results == {}
+    assert sorted(outcome.failures) == [1, 3]
+    assert "setup failed" in outcome.failures[1]
+
+
+def test_prompt_file_with_invalid_encoding_falls_back(tmp_path):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_bytes(b"\xff\xfe broken")
+    assert "faithful OCR transcription" in load_prompt(Config(prompt_file=str(prompt)))
+
+
+def test_no_work_starts_after_the_document_time_limit(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["scan", "scan"]), CFG, workdir)
+    client = FakeClient({"default": PageResult(text="late", rotation=0)})
+    outcome = read_pages(pages, Config(api_key="k", document_timeout=0.5), workdir, client)
+    assert client.calls == 0
+    assert sorted(outcome.failures) == [1, 2]
+    assert "time limit" in outcome.failures[1]

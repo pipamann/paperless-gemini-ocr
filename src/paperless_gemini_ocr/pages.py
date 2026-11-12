@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import re
 import subprocess
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass
@@ -40,7 +42,18 @@ _MAX_FORM_DEPTH = 6
 _INSTRUCTION_BUDGET = 200_000
 # Same idea for the decoded size of the content streams, checked before they
 # are parsed, so a tiny stream that inflates to gigabytes is never unpacked.
-_DECODED_BYTE_BUDGET = 32 * 1024 * 1024
+_DECODED_BYTE_BUDGET = 8 * 1024 * 1024
+# Upper bound for the tokens in those streams, counted on the raw bytes before
+# parsing: the parser builds one object per instruction.
+_TOKEN_BUDGET = 1_500_000
+_TOKEN_BREAKS = b" \n\r\t\f\0()<>[]{}/%"
+# pdftotext output beyond this size is not read (a real 1000-page document
+# stays far below).
+_TEXT_OUTPUT_LIMIT = 64 * 1024 * 1024
+# An image from this share of the page on is taken to carry content of its
+# own; next to it, a short text is not accepted as the page's text.
+_SIGNIFICANT_IMAGE = 0.2
+_MAX_ANNOTATIONS = 500
 # Seconds the page analysis of one document may take; later pages then count
 # as scans without being looked at.
 _ANALYSIS_SECONDS = 120.0
@@ -103,8 +116,8 @@ def _decode_stage(name: str, data: bytes, limit: int) -> bytes | None:
     return None
 
 
-def _decoded_size(stream, limit: int) -> int:
-    """Decoded length of a stream, or ``limit + 1`` once it may be larger.
+def _decoded(stream, limit: int) -> bytes | None:
+    """Decoded stream data, or None once it may be larger than ``limit``.
 
     Every filter of the chain is undone with a cap on its output, so nothing
     is ever unpacked beyond ``limit``. A chain with a filter that cannot be
@@ -122,12 +135,12 @@ def _decoded_size(stream, limit: int) -> int:
         names = [str(f) for f in filters]
     for name in names:
         if len(data) > limit:
-            return limit + 1
+            return None
         decoded = _decode_stage(name, data, limit)
         if decoded is None:
-            return limit + 1
+            return None
         data = decoded
-    return len(data) if len(data) <= limit else limit + 1
+    return data if len(data) <= limit else None
 
 
 class _Budget:
@@ -136,11 +149,18 @@ class _Budget:
     def __init__(self) -> None:
         self.instructions = _INSTRUCTION_BUDGET
         self.decoded_bytes = _DECODED_BYTE_BUDGET
+        self.tokens = _TOKEN_BUDGET
 
     def charge_stream(self, stream) -> None:
         """Call before a stream is parsed."""
-        self.decoded_bytes -= _decoded_size(stream, self.decoded_bytes)
-        if self.decoded_bytes < 0:
+        data = _decoded(stream, self.decoded_bytes)
+        if data is None:
+            raise _BudgetExceeded
+        self.decoded_bytes -= len(data)
+        # Every instruction is followed by white space or a delimiter, so the
+        # number of those bytes is an upper bound for the instructions.
+        self.tokens -= len(data) - len(data.translate(None, _TOKEN_BREAKS)) + 1
+        if self.tokens < 0:
             raise _BudgetExceeded
 
     def charge_instructions(self, count: int) -> None:
@@ -182,24 +202,45 @@ def looks_broken(text: str) -> bool:
     """Text layer whose font mapping is lost: replacement or private-use characters."""
     if not text:
         return False
-    bad = text.count("�") + 5 * text.count("(cid:")
-    bad += sum(1 for ch in text if "" <= ch <= "")
+    bad = text.count("\ufffd") + 5 * text.count("(cid:")
+    bad += sum(1 for ch in text if "\ue000" <= ch <= "\uf8ff")
     return bad / len(text) > 0.1
 
 
 def pdf_page_texts(path: Path) -> list[str] | None:
-    """Embedded text of every page via one pdftotext run, or None on failure."""
+    """Embedded text of every page via one pdftotext run, or None on failure.
+
+    Output size and run time are capped, so a crafted file cannot fill the
+    memory through this call.
+    """
     try:
-        proc = subprocess.run(
-            ["pdftotext", "-q", "-layout", "-enc", "UTF-8", str(path), "-"],
-            capture_output=True,
-            check=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
+        with tempfile.TemporaryFile() as out:
+            proc = subprocess.Popen(
+                ["pdftotext", "-q", "-layout", "-enc", "UTF-8", str(path), "-"],
+                stdout=out,
+                stderr=subprocess.DEVNULL,
+            )
+            give_up_at = time.monotonic() + 120
+            while True:
+                try:
+                    code = proc.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    too_big = os.fstat(out.fileno()).st_size > _TEXT_OUTPUT_LIMIT
+                    if too_big or time.monotonic() > give_up_at:
+                        proc.kill()
+                        proc.wait()
+                        logger.warning("pdftotext stopped: output too large or too slow")
+                        return None
+            if code != 0 or os.fstat(out.fileno()).st_size > _TEXT_OUTPUT_LIMIT:
+                logger.warning("pdftotext failed (exit %s)", code)
+                return None
+            out.seek(0)
+            data = out.read()
+    except OSError as e:
         logger.warning("pdftotext failed: %s", type(e).__name__)
         return None
-    pieces = proc.stdout.decode("utf-8", errors="replace").split("\f")
+    pieces = data.decode("utf-8", errors="replace").split("\f")
     # pdftotext ends every page with a form feed, so the last piece is empty.
     if pieces and not pieces[-1].strip():
         pieces.pop()
@@ -278,7 +319,10 @@ def _image_area(
             subtype = str(xobject.get("/Subtype"))
             if subtype == "/Image":
                 area += min(limit, abs(ctm[0] * ctm[3] - ctm[1] * ctm[2]))
-            elif subtype == "/Form" and depth < _MAX_FORM_DEPTH:
+            elif subtype == "/Form":
+                if depth >= _MAX_FORM_DEPTH:
+                    # Not looked at is not the same as empty.
+                    raise _BudgetExceeded
                 budget.charge_stream(xobject)
                 matrix = xobject.get("/Matrix")
                 inner = (
@@ -324,7 +368,26 @@ def image_coverage(page) -> tuple[float, bool]:
         0,
         budget,
     )
-    return min(1.0, area / page_area), count > 0
+    annotations = _annotation_area(page, page_area)
+    return min(1.0, (area + annotations) / page_area), count > 0 or annotations > 0
+
+
+def _annotation_area(page, page_area: float) -> float:
+    """Area of annotations that paint something, e.g. a scan placed as a stamp."""
+    annots = page.obj.get("/Annots")
+    if annots is None:
+        return 0.0
+    area = 0.0
+    for index, annot in enumerate(annots):
+        if index >= _MAX_ANNOTATIONS:
+            raise _BudgetExceeded
+        if str(annot.get("/Subtype")) in ("/Link", "/Popup", "/Widget"):
+            continue
+        if annot.get("/AP") is None or annot.get("/Rect") is None:
+            continue
+        x0, y0, x1, y1 = (float(v) for v in annot.get("/Rect"))
+        area += min(page_area, abs((x1 - x0) * (y1 - y0)))
+    return area
 
 
 # ---------------------------------------------------------------------------
@@ -333,18 +396,23 @@ def image_coverage(page) -> tuple[float, bool]:
 
 
 def classify(text: str, coverage: float, paints: bool, cfg: Config) -> tuple[str, str]:
-    """Return (kind, reason) for one PDF page."""
-    has_text = len(text) >= cfg.min_text_chars
-    if not paints and not has_text:
+    """Return (kind, reason) for one PDF page.
+
+    The costly mistake is to call a scan "embedded": its content would be
+    lost. So everything doubtful goes to the model.
+    """
+    if not paints and not text:
         return "blank", "empty page"
     if cfg.digital_pages == "gemini":
         return "gemini", "all pages configured for the model"
     if coverage >= cfg.scan_image_coverage:
         return "gemini", f"scan (images cover {coverage:.0%})"
-    if not has_text:
+    if not text:
         return "gemini", "no text layer"
     if looks_broken(text):
         return "gemini", "text layer unreadable"
+    if coverage >= _SIGNIFICANT_IMAGE and len(text) < cfg.min_text_chars:
+        return "gemini", f"image ({coverage:.0%} of the page) with little text"
     return "embedded", "embedded text"
 
 
@@ -382,6 +450,10 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
                 try:
                     single = pikepdf.Pdf.new()
                     single.pages.append(pdf_page)
+                    # Pages often share one resource dictionary. Without this
+                    # the upload would carry the images and text of other
+                    # pages along, unused but readable.
+                    single.pages[0].remove_unreferenced_resources()
                     single.save(target)
                     single.close()
                     page.payload = target
@@ -393,7 +465,13 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
     return pages
 
 
-def render_page(pdf_path: Path, number: int, dpi: int, workdir: Path) -> Path:
+def render_page(
+    pdf_path: Path,
+    number: int,
+    dpi: int,
+    workdir: Path,
+    timeout: float = 180.0,
+) -> Path:
     prefix = workdir / f"render-{number:05d}"
     subprocess.run(
         [
@@ -412,7 +490,7 @@ def render_page(pdf_path: Path, number: int, dpi: int, workdir: Path) -> Path:
         ],
         check=True,
         capture_output=True,
-        timeout=180,
+        timeout=max(1.0, timeout),
     )
     return prefix.with_suffix(".jpg")
 
@@ -475,7 +553,12 @@ def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
 # ---------------------------------------------------------------------------
 
 
-def load_payload(page: Page, cfg: Config, workdir: Path) -> tuple[bytes, str]:
+def load_payload(
+    page: Page,
+    cfg: Config,
+    workdir: Path,
+    timeout: float = 180.0,
+) -> tuple[bytes, str]:
     """Bytes and MIME type to send for a page. Safe to call from worker threads."""
     is_pdf_page = page.source_pdf is not None
     use_file = (
@@ -489,7 +572,7 @@ def load_payload(page: Page, cfg: Config, workdir: Path) -> tuple[bytes, str]:
         raise AnalysisError("page too large to upload")
     dpi = cfg.render_dpi
     for _ in range(3):
-        rendered = render_page(page.source_pdf, page.number, dpi, workdir)
+        rendered = render_page(page.source_pdf, page.number, dpi, workdir, timeout)
         if rendered.stat().st_size <= MAX_INLINE_BYTES:
             return rendered.read_bytes(), "image/jpeg"
         dpi = max(72, dpi * 2 // 3)

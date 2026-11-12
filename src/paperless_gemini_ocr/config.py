@@ -97,8 +97,9 @@ class Config:
     # Share of the page covered by images from which a page counts as a scan,
     # whatever text layer the scanner added.
     scan_image_coverage: float = 0.7
-    # Embedded text shorter than this does not count as a text layer.
-    min_text_chars: int = 20
+    # Next to an image that takes a fifth of the page or more, embedded text
+    # shorter than this is not trusted to be the page's whole content.
+    min_text_chars: int = 200
 
     # "fallback": Tesseract only runs when the model failed for a page.
     # "always": Tesseract runs for every document, as without the plugin, and

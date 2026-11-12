@@ -53,12 +53,15 @@ def _font(pdf: pikepdf.Pdf):
 
 
 def add_page(pdf: pikepdf.Pdf, kind: str, text: str = "") -> None:
-    """Append a page: scan, scan_text, text, text_logo, blank, form_scan."""
+    """Append a page: scan, scan_text, text, text_logo, text_photo, vector, blank, form_scan."""
     pdf.add_blank_page(page_size=A4)
     page = pdf.pages[-1]
     full = b"q 595 0 0 842 0 0 cm /Im0 Do Q\n"
-    visible = f"BT /F1 12 Tf 50 700 Td ({text}) Tj ET\n".encode()
-    hidden = f"BT 3 Tr /F1 12 Tf 50 700 Td ({text}) Tj ET\n".encode()
+    # Long texts are wrapped so that they stay on the page.
+    lines = [text[i : i + 80] for i in range(0, len(text), 80)] or [""]
+    shown = " T* ".join(f"({line}) Tj" for line in lines)
+    visible = f"BT /F1 12 Tf 14 TL 50 700 Td {shown} ET\n".encode()
+    hidden = f"BT 3 Tr /F1 12 Tf 14 TL 50 700 Td {shown} ET\n".encode()
     resources = Dictionary(
         XObject=Dictionary(Im0=_image_xobject(pdf)),
         Font=Dictionary(F1=_font(pdf)),
@@ -73,6 +76,11 @@ def add_page(pdf: pikepdf.Pdf, kind: str, text: str = "") -> None:
         content = visible
     elif kind == "text_logo":
         content = b"q 100 0 0 50 40 760 cm /Im0 Do Q\n" + visible
+    elif kind == "text_photo":
+        # An image over a good third of the page, plus text.
+        content = b"q 595 0 0 300 0 100 cm /Im0 Do Q\n" + visible
+    elif kind == "vector":
+        content = b"0 0 m 300 300 l S\n"
     elif kind == "form_scan":
         form = pikepdf.Stream(
             pdf,
@@ -137,17 +145,24 @@ class _Signal:
 class _ModeChoices:
     OFF = "off"
     AUTO = "auto"
+    FORCE = "force"
 
 
 class StubTesseractParser:
-    """Behaves like the built-in parser as far as the plugin can tell."""
+    """Behaves like the built-in parser as far as the plugin can tell.
+
+    Like the real one it writes its OCR result to ``<tempdir>/archive.pdf``
+    whenever OCR runs, and only publishes it as ``archive_path`` when an
+    archive was asked for.
+    """
 
     calls: list[str] = []
     fail_modes: set[str] = set()
+    configured_mode: str = _ModeChoices.AUTO
 
     def __init__(self) -> None:
         self.tempdir = Path(tempfile.mkdtemp(prefix="stub-parser-"))
-        self.settings = SimpleNamespace(mode=_ModeChoices.AUTO)
+        self.settings = SimpleNamespace(mode=type(self).configured_mode)
         self.text: str | None = None
         self.archive_path: Path | None = None
         self.log = logging.getLogger("stub")
@@ -171,13 +186,24 @@ class StubTesseractParser:
         if mode in type(self).fail_modes:
             raise ParseError(f"stub failure in mode {mode}")
         self.text = f"local text ({mode})"
-        if produce_archive:
-            archive = self.tempdir / "archive.pdf"
+        internal = self.tempdir / "archive.pdf"
+        if mode == _ModeChoices.FORCE:
+            # OCR ran: an output PDF with a recognised text layer per page.
+            count = 1
             if mime_type == "application/pdf":
-                shutil.copy(document_path, archive)
+                with pikepdf.open(document_path) as source:
+                    count = len(source.pages)
+            pdf = pikepdf.Pdf.new()
+            for index in range(count):
+                add_page(pdf, "scan_text", f"tesseract text of page {index + 1} in this file")
+            pdf.save(internal)
+        elif produce_archive:
+            if mime_type == "application/pdf":
+                shutil.copy(document_path, internal)
             else:
-                make_pdf(archive, ["scan"])
-            self.archive_path = archive
+                make_pdf(internal, ["scan"])
+        if produce_archive:
+            self.archive_path = internal
 
 
 def _install_stubs() -> None:
@@ -212,6 +238,7 @@ _install_stubs()
 def stub_parser():
     StubTesseractParser.calls = []
     StubTesseractParser.fail_modes = set()
+    StubTesseractParser.configured_mode = _ModeChoices.AUTO
     return StubTesseractParser
 
 

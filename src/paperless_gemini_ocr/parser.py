@@ -9,8 +9,9 @@ Rules it follows:
 
 * A model failure never fails an import. The affected pages get local OCR
   text and the document is tagged, so nothing is silently worse.
-* "Reprocess" on an existing document fails loudly instead, so good text is
-  never replaced by fallback text.
+* "Reprocess" on an existing document raises instead, so good text is never
+  replaced by fallback text. Paperless logs the error and leaves the
+  document as it was.
 * Documents without scanned pages are handed to the built-in parser untouched.
 """
 
@@ -35,12 +36,12 @@ from .pages import analyse_pdf
 from .pages import normalise_text
 from .pages import pdf_page_texts
 from .pages import prepare_image
+from .pipeline import DocumentResult
 from .pipeline import assemble
 from .pipeline import read_pages
 
 if TYPE_CHECKING:
     from .pages import Page
-    from .pipeline import DocumentResult
 
 logger = logging.getLogger("paperless.parsing.gemini_ocr")
 
@@ -113,27 +114,27 @@ class GeminiOcrParser(RasterisedDocumentParser):
             return
 
         # The model reads the pages while the local part of the import runs.
-        ocr_ran = cfg.local_ocr == "always"
         with ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="gemini-ocr-doc",
         ) as pool:
             future = pool.submit(read_pages, pages, cfg, workdir)
             try:
-                if ocr_ran:
+                if cfg.local_ocr == "always":
                     super().parse(
                         document_path,
                         mime_type,
                         produce_archive=produce_archive,
                     )
+                    archive_from_ocr = True
                 else:
-                    self._parse_local(
+                    archive_from_ocr = self._parse_local(
                         document_path,
                         mime_type,
                         produce_archive=produce_archive,
                     )
             finally:
-                outcome = future.result()
+                outcome = self._collect(future, scan_pages)
 
         local_texts: dict[int, str] = {}
         if outcome.failures:
@@ -143,25 +144,15 @@ class GeminiOcrParser(RasterisedDocumentParser):
                     f"{', '.join(str(n) for n in sorted(outcome.failures))}; "
                     "content left unchanged",
                 )
-            if not ocr_ran:
-                ocr_ran = self._run_fallback_ocr(
-                    document_path,
-                    mime_type,
-                    produce_archive=produce_archive,
-                )
-            local_texts = self._local_page_texts(
-                document_path,
-                mime_type,
-                pages,
-                outcome,
-            )
+            local_texts = self._local_texts(document_path, mime_type, pages, outcome)
             state.set_report(
                 state.Report(total_pages=len(pages), failures=dict(outcome.failures)),
             )
 
         self.text = assemble(pages, outcome, local_texts)
 
-        if cfg.rotate != "off" and not ocr_ran:
+        # OCRmyPDF turns pages itself; turning them again would undo that.
+        if cfg.rotate != "off" and not archive_from_ocr:
             self._apply_rotation(
                 pages,
                 outcome,
@@ -184,6 +175,16 @@ class GeminiOcrParser(RasterisedDocumentParser):
             time.monotonic() - started,
         )
 
+    def _collect(self, future, scan_pages: list[Page]) -> DocumentResult:
+        """Result of the model run; an unexpected error counts as all pages failed."""
+        try:
+            return future.result()
+        except Exception as e:
+            self.log.warning("Gemini OCR: reading failed (%s)", type(e).__name__)
+            return DocumentResult(
+                failures={p.number: f"{type(e).__name__}" for p in scan_pages},
+            )
+
     # ------------------------------------------------------------------
     # Local part
     # ------------------------------------------------------------------
@@ -194,12 +195,13 @@ class GeminiOcrParser(RasterisedDocumentParser):
         mime_type: str,
         *,
         produce_archive: bool,
-    ) -> None:
+    ) -> bool:
         """Archive PDF and embedded text without running Tesseract.
 
         Uses the built-in parser's own OCR_MODE=off path. Should that path
         fail on an odd file, the normal path with OCR gets a try before the
-        import is given up, as it would without the plugin.
+        import is given up, as it would without the plugin. Returns True when
+        that happened, i.e. when OCRmyPDF produced the archive.
         """
         from paperless.models import ModeChoices
 
@@ -207,7 +209,7 @@ class GeminiOcrParser(RasterisedDocumentParser):
         self.settings.mode = ModeChoices.OFF
         try:
             super().parse(document_path, mime_type, produce_archive=produce_archive)
-            return
+            return False
         except Exception as e:
             self.log.warning(
                 "Gemini OCR: import without local OCR failed (%s), retrying with it",
@@ -218,64 +220,118 @@ class GeminiOcrParser(RasterisedDocumentParser):
         self.text = None
         self.archive_path = None
         super().parse(document_path, mime_type, produce_archive=produce_archive)
+        return True
 
-    def _run_fallback_ocr(
-        self,
-        document_path: Path,
-        mime_type: str,
-        *,
-        produce_archive: bool,
-    ) -> bool:
-        """Run the built-in parser with OCR for pages the model failed on.
-
-        Returns True when it replaced the result of the OCR-free run. On an
-        error that result is restored: the document is imported either way.
-        """
-        kept_text = self.text
-        kept_archive: Path | None = None
-        if self.archive_path and Path(self.archive_path).is_file():
-            kept_archive = Path(self.tempdir) / "archive-without-ocr.pdf"
-            Path(self.archive_path).replace(kept_archive)
-        self.text = None
-        self.archive_path = None
-        try:
-            super().parse(document_path, mime_type, produce_archive=produce_archive)
-            return True
-        except Exception as e:
-            self.log.warning(
-                "Gemini OCR: local OCR for the failed pages failed too (%s)",
-                type(e).__name__,
-            )
-            self.text = kept_text
-            self.archive_path = kept_archive
-            return False
-
-    def _local_page_texts(
+    def _local_texts(
         self,
         document_path: Path,
         mime_type: str,
         pages: list[Page],
         outcome: DocumentResult,
     ) -> dict[int, str]:
-        """Local text for exactly the pages the model failed on."""
+        """Best local text for exactly the pages the model failed on.
+
+        Local OCR where it yields something, otherwise whatever text layer the
+        page brought along (a scanner's own, for instance).
+        """
         failed = sorted(outcome.failures)
-        if len(pages) == 1:
-            # The built-in parser's own text, as an import without the plugin has it.
-            return {1: self.text or ""}
-        source: Path | None = None
-        if self.archive_path and Path(self.archive_path).is_file():
-            source = Path(self.archive_path)
-        elif mime_type == "application/pdf":
-            source = document_path
-        if source is not None:
-            texts = pdf_page_texts(source)
-            if texts is not None and len(texts) == len(pages):
-                return {n: normalise_text(texts[n - 1]) for n in failed}
-        self.log.warning(
-            "Gemini OCR: no per-page local text available, page(s) %s stay empty",
-            ", ".join(str(n) for n in failed),
-        )
-        return {}
+        by_number = {p.number: p for p in pages}
+        texts = {n: by_number[n].embedded_text for n in failed}
+        for number, text in self._ocr_failed_pages(
+            document_path,
+            mime_type,
+            failed,
+            len(pages),
+        ).items():
+            if text.strip():
+                texts[number] = text
+        return texts
+
+    def _ocr_failed_pages(
+        self,
+        document_path: Path,
+        mime_type: str,
+        failed: list[int],
+        total_pages: int,
+    ) -> dict[int, str]:
+        """Run Tesseract over the failed pages only and return their text.
+
+        A separate pass with forced OCR: the regular modes may skip OCR (a
+        PDF that already has text) or produce no usable output file (no
+        archive wanted). Text, archive and settings of the import itself are
+        put back afterwards, whatever happens here.
+        """
+        import pikepdf
+        from paperless.models import ModeChoices
+
+        configured_mode = self.settings.mode
+        if configured_mode == ModeChoices.OFF:
+            # OCR is switched off for this installation; respect that.
+            return {}
+
+        tempdir = Path(self.tempdir)
+        workdir = tempdir / "gemini-ocr"
+        kept_text = self.text
+        kept_archive = Path(self.archive_path) if self.archive_path else None
+        aside: Path | None = None
+        outputs = [tempdir / "archive.pdf", tempdir / "archive-fallback.pdf"]
+        try:
+            if mime_type == "application/pdf":
+                subset = workdir / "failed-pages.pdf"
+                with pikepdf.open(document_path) as source:
+                    only_failed = pikepdf.Pdf.new()
+                    for number in failed:
+                        only_failed.pages.append(source.pages[number - 1])
+                    only_failed.save(subset)
+                    only_failed.close()
+                numbers = failed
+            else:
+                subset = document_path
+                numbers = list(range(1, total_pages + 1))
+
+            if kept_archive is not None and kept_archive.is_file():
+                aside = tempdir / "gemini-ocr-first-pass-archive.pdf"
+                kept_archive.replace(aside)
+            for output in outputs:
+                output.unlink(missing_ok=True)
+
+            self.settings.mode = ModeChoices.FORCE
+            self.text = None
+            self.archive_path = None
+            super().parse(subset, mime_type, produce_archive=False)
+            whole = self.text or ""
+
+            per_page: list[str] | None = None
+            for output in outputs:
+                if output.is_file():
+                    per_page = pdf_page_texts(output)
+                    break
+            if len(numbers) == 1:
+                return {numbers[0]: whole or normalise_text((per_page or [""])[0])}
+            if per_page is not None and len(per_page) == len(numbers):
+                found = {
+                    n: normalise_text(t)
+                    for n, t in zip(numbers, per_page, strict=True)
+                    if n in failed
+                }
+                if any(found.values()) or not whole:
+                    return found
+            # No page boundaries to go by: keep what OCR found, once.
+            return {failed[0]: whole}
+        except Exception as e:
+            self.log.warning(
+                "Gemini OCR: local OCR for the failed pages failed too (%s)",
+                type(e).__name__,
+            )
+            return {}
+        finally:
+            self.settings.mode = configured_mode
+            for output in outputs:
+                output.unlink(missing_ok=True)
+            if aside is not None and kept_archive is not None:
+                aside.replace(kept_archive)
+            self.text = kept_text
+            self.archive_path = kept_archive
 
     # ------------------------------------------------------------------
     # Rotation
@@ -331,25 +387,49 @@ class GeminiOcrParser(RasterisedDocumentParser):
 # ----------------------------------------------------------------------
 
 
+def _review_tag(name: str):
+    """The tag for flagged documents; created on first use, safe against a race."""
+    from django.db import IntegrityError
+    from django.db import transaction
+    from documents.models import Tag
+
+    for _ in range(3):
+        tag = Tag.objects.filter(name__iexact=name).first()
+        if tag is not None:
+            return tag
+        try:
+            with transaction.atomic():
+                return Tag.objects.create(name=name, matching_algorithm=Tag.MATCH_NONE)
+        except IntegrityError:
+            # Another worker created it at the same moment.
+            continue
+    raise RuntimeError(f"tag {name!r} can neither be found nor created")
+
+
 def _flag_document(document, report: state.Report) -> None:
+    """Tag and note, each in its own savepoint.
+
+    Neither may undo the import this runs inside of, and a problem with one
+    must not take the other with it.
+    """
     from django.db import transaction
     from documents.models import Note
-    from documents.models import Tag
 
     cfg = Config.from_env()
     target = getattr(document, "root_document", None) or document
-    # Own savepoint: an error here must not undo the import it runs inside of.
-    with transaction.atomic():
-        if cfg.failure_tag:
-            tag = Tag.objects.filter(name__iexact=cfg.failure_tag).first()
-            if tag is None:
-                tag = Tag.objects.create(
-                    name=cfg.failure_tag,
-                    matching_algorithm=Tag.MATCH_NONE,
-                )
-            target.tags.add(tag)
-        if cfg.failure_note:
-            Note.objects.create(document=target, note=report.note())
+    if cfg.failure_tag:
+        try:
+            tag = _review_tag(cfg.failure_tag)
+            with transaction.atomic():
+                target.tags.add(tag)
+        except Exception:
+            logger.exception("Gemini OCR: could not tag document %s", target.pk)
+    if cfg.failure_note:
+        try:
+            with transaction.atomic():
+                Note.objects.create(document=target, note=report.note())
+        except Exception:
+            logger.exception("Gemini OCR: could not add a note to document %s", target.pk)
 
 
 def _on_consumption_started(sender, filename=None, **kwargs) -> None:
@@ -361,12 +441,12 @@ def _on_consumption_finished(sender, document=None, **kwargs) -> None:
     if report is None or document is None:
         return
     try:
-        _flag_document(document, report)
         logger.warning(
-            "Gemini OCR: document %s flagged for review: %s",
+            "Gemini OCR: document %s needs review: %s",
             document.pk,
             report.note(),
         )
+        _flag_document(document, report)
     except Exception:
         logger.exception("Gemini OCR: could not flag document %s", document.pk)
 

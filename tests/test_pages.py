@@ -71,11 +71,29 @@ def test_resources_inherited_from_pages_node(pdf_factory, workdir, tmp_path):
     assert kinds(analyse_pdf(target, CFG, workdir)) == ["gemini"]
 
 
-def test_text_page_without_text_layer_goes_to_model(pdf_factory, workdir):
-    """Too little text to count as a layer, but the page is not empty."""
-    pages = analyse_pdf(pdf_factory(["text"], text="Hi"), CFG, workdir)
+def test_short_born_digital_page_keeps_its_text(pdf_factory, workdir):
+    """A page that only says "Approved" is still exact text, not a scan."""
+    pages = analyse_pdf(pdf_factory(["text"], text="Approved"), CFG, workdir)
+    assert kinds(pages) == ["embedded"]
+    assert pages[0].embedded_text == "Approved"
+
+
+def test_drawing_without_text_goes_to_model(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["vector"]), CFG, workdir)
     assert kinds(pages) == ["gemini"]
     assert pages[0].reason == "no text layer"
+
+
+def test_large_image_with_a_caption_goes_to_model(pdf_factory, workdir):
+    """A photographed receipt with a page number below it: the image is the content."""
+    pages = analyse_pdf(pdf_factory(["text_photo"], text="Seite 3"), CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert "little text" in pages[0].reason
+
+
+def test_large_figure_in_a_text_page_stays_embedded(pdf_factory, workdir):
+    pages = analyse_pdf(pdf_factory(["text_photo"], text="Bericht " * 40), CFG, workdir)
+    assert kinds(pages) == ["embedded"]
 
 
 def test_all_pages_to_model_when_configured(pdf_factory, workdir):
@@ -261,3 +279,115 @@ def test_run_length_decoding_is_bounded():
 
     assert _run_length_decode(bytes([2, 65, 66, 67, 254, 90, 128]), 100) == b"ABCZZZ"
     assert _run_length_decode(bytes([129, 0]) * 1000, 1000) is None
+
+
+def test_exported_page_does_not_carry_other_pages_along(tmp_path, workdir):
+    """Pages sharing one resource dictionary: only the page's own objects are uploaded."""
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import add_page
+
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, "scan")
+    add_page(pdf, "text", "Other page with a secret IBAN DE00 1111 2222")
+    secret = pikepdf.Stream(
+        pdf,
+        b"BT /F1 12 Tf 50 700 Td (CONFIDENTIAL-OTHER-PAGE) Tj ET",
+        Type=Name.XObject,
+        Subtype=Name.Form,
+        BBox=[0, 0, 595, 842],
+    )
+    shared = pdf.pages[0].obj["/Resources"]
+    shared["/XObject"]["/FmOther"] = secret
+    shared["/Font"] = pdf.pages[1].obj["/Resources"]["/Font"]
+    pdf.pages[1].obj["/Resources"] = shared
+    path = tmp_path / "shared.pdf"
+    pdf.save(path)
+
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini", "embedded"]
+    with pikepdf.open(pages[0].payload) as single:
+        resources = single.pages[0].obj["/Resources"]
+        assert "/FmOther" not in resources.get("/XObject", {})
+    assert b"CONFIDENTIAL-OTHER-PAGE" not in pages[0].payload.read_bytes()
+
+
+def test_scan_hidden_in_deeply_nested_forms_is_not_called_digital(tmp_path, workdir):
+    """Seven levels of forms around the page image: unseen is not the same as empty."""
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    inner = pikepdf.Stream(
+        pdf,
+        b"/Im0 Do",
+        Type=Name.XObject,
+        Subtype=Name.Form,
+        BBox=[0, 0, 1, 1],
+        Resources=Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf))),
+    )
+    for _ in range(7):
+        inner = pikepdf.Stream(
+            pdf,
+            b"/Fm0 Do",
+            Type=Name.XObject,
+            Subtype=Name.Form,
+            BBox=[0, 0, 1, 1],
+            Resources=Dictionary(XObject=Dictionary(Fm0=inner)),
+        )
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    page = pdf.pages[0]
+    page.obj["/Resources"] = Dictionary(XObject=Dictionary(Fm0=inner), Font=Dictionary(F1=font))
+    page.obj["/Contents"] = pikepdf.Stream(
+        pdf,
+        b"q 595 0 0 842 0 0 cm /Fm0 Do Q BT 3 Tr /F1 12 Tf 50 700 Td (scanner text layer of this page) Tj ET",
+    )
+    path = tmp_path / "nested.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+
+
+def test_scan_placed_as_a_stamp_annotation_goes_to_model(tmp_path, workdir):
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    appearance = pikepdf.Stream(
+        pdf,
+        b"q 595 0 0 842 0 0 cm /Im0 Do Q",
+        Type=Name.XObject,
+        Subtype=Name.Form,
+        BBox=[0, 0, 595, 842],
+        Resources=Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf))),
+    )
+    pdf.pages[0].obj["/Annots"] = pikepdf.Array(
+        [
+            pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Stamp,
+                    Rect=[0, 0, 595, 842],
+                    AP=Dictionary(N=appearance),
+                ),
+            ),
+        ],
+    )
+    path = tmp_path / "stamp.pdf"
+    pdf.save(path)
+    assert kinds(analyse_pdf(path, CFG, workdir)) == ["gemini"]
+
+
+def test_many_tiny_instructions_are_refused_before_parsing():
+    """Under the byte limit, but millions of instructions: one object each if parsed."""
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+
+    with pytest.raises(_BudgetExceeded):
+        _coverage_of(b"q Q " * 1_000_000)
