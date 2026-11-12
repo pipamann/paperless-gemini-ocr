@@ -208,3 +208,56 @@ def test_contents_array_and_compressed_streams_still_work(pdf_factory, workdir, 
     pages = analyse_pdf(target, CFG, workdir)
     assert kinds(pages) == ["gemini"]
     assert pages[0].reason.startswith("scan")
+
+
+def _coverage_of(content: bytes, **stream_keys):
+    from paperless_gemini_ocr.pages import image_coverage
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    pdf.pages[0].obj["/Contents"] = pikepdf.Stream(pdf, content, **stream_keys)
+    return image_coverage(pdf.pages[0])
+
+
+def test_chained_filters_cannot_hide_a_bomb():
+    import zlib
+
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+
+    twice = zlib.compress(zlib.compress(b"q Q " * 25_000_000, 9), 9)
+    assert len(twice) < 20_000
+    with pytest.raises(_BudgetExceeded):
+        _coverage_of(twice, Filter=pikepdf.Array([Name.FlateDecode, Name.FlateDecode]))
+
+
+def test_filter_without_size_bound_is_refused():
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+
+    with pytest.raises(_BudgetExceeded):
+        _coverage_of(b"\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01", Filter=Name.LZWDecode)
+
+
+def test_ascii85_then_flate_content_is_analysed():
+    """An old but legitimate way to store page content."""
+    import base64
+    import zlib
+
+    from pikepdf import Name
+
+    encoded = base64.a85encode(zlib.compress(b"q 1 0 0 1 0 0 cm Q"), adobe=True)[2:]
+    coverage, paints = _coverage_of(
+        encoded,
+        Filter=pikepdf.Array([Name.ASCII85Decode, Name.FlateDecode]),
+    )
+    assert (coverage, paints) == (0.0, True)
+
+
+def test_run_length_decoding_is_bounded():
+    from paperless_gemini_ocr.pages import _run_length_decode
+
+    assert _run_length_decode(bytes([2, 65, 66, 67, 254, 90, 128]), 100) == b"ABCZZZ"
+    assert _run_length_decode(bytes([129, 0]) * 1000, 1000) is None

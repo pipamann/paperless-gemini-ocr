@@ -11,6 +11,7 @@ It needs ``pdftotext`` and ``pdftoppm`` (poppler), which Paperless-ngx ships.
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import subprocess
@@ -40,9 +41,6 @@ _INSTRUCTION_BUDGET = 200_000
 # Same idea for the decoded size of the content streams, checked before they
 # are parsed, so a tiny stream that inflates to gigabytes is never unpacked.
 _DECODED_BYTE_BUDGET = 32 * 1024 * 1024
-# Streams with a filter whose output size cannot be bounded cheaply are only
-# parsed while they are small.
-_OPAQUE_FILTER_RAW_LIMIT = 64 * 1024
 # Seconds the page analysis of one document may take; later pages then count
 # as scans without being looked at.
 _ANALYSIS_SECONDS = 120.0
@@ -57,25 +55,79 @@ class _BudgetExceeded(Exception):
     """A page needs more analysis work than a real document plausibly does."""
 
 
+def _run_length_decode(data: bytes, limit: int) -> bytes | None:
+    out = bytearray()
+    index = 0
+    while index < len(data):
+        length = data[index]
+        index += 1
+        if length == 128:
+            break
+        if length < 128:
+            out += data[index : index + length + 1]
+            index += length + 1
+        else:
+            out += data[index : index + 1] * (257 - length)
+            index += 1
+        if len(out) > limit:
+            return None
+    return bytes(out)
+
+
+def _decode_stage(name: str, data: bytes, limit: int) -> bytes | None:
+    """Undo one stream filter with at most ``limit`` bytes of output, else None."""
+    try:
+        if name in ("/FlateDecode", "/Fl"):
+            inflater = zlib.decompressobj()
+            out = inflater.decompress(data, limit + 1)
+            if len(out) > limit or inflater.unconsumed_tail:
+                return None
+            return out
+        if name in ("/ASCII85Decode", "/A85"):
+            body = b"".join(data.split())
+            if not body.startswith(b"<~"):
+                body = b"<~" + body
+            if not body.endswith(b"~>"):
+                body += b"~>"
+            return base64.a85decode(body, adobe=True)
+        if name in ("/ASCIIHexDecode", "/AHx"):
+            body = b"".join(data.split()).rstrip(b">")
+            if len(body) % 2:
+                body += b"0"
+            return bytes.fromhex(body.decode("ascii"))
+        if name in ("/RunLengthDecode", "/RL"):
+            return _run_length_decode(data, limit)
+    except (ValueError, zlib.error):
+        return None
+    # LZW and anything else: no cheap way to bound the output.
+    return None
+
+
 def _decoded_size(stream, limit: int) -> int:
-    """Decoded length of a stream, or ``limit + 1`` once it is known to be larger."""
+    """Decoded length of a stream, or ``limit + 1`` once it may be larger.
+
+    Every filter of the chain is undone with a cap on its output, so nothing
+    is ever unpacked beyond ``limit``. A chain with a filter that cannot be
+    bounded counts as too large.
+    """
     import pikepdf
 
-    raw = stream.read_raw_bytes()
+    data = stream.read_raw_bytes()
     filters = stream.get("/Filter")
     if filters is None:
-        return len(raw)
-    names = [str(filters)] if isinstance(filters, pikepdf.Name) else [str(f) for f in filters]
-    if names == ["/FlateDecode"]:
-        inflater = zlib.decompressobj()
-        try:
-            out = inflater.decompress(raw, limit + 1)
-        except zlib.error:
+        names: list[str] = []
+    elif isinstance(filters, pikepdf.Name):
+        names = [str(filters)]
+    else:
+        names = [str(f) for f in filters]
+    for name in names:
+        if len(data) > limit:
             return limit + 1
-        if len(out) > limit or inflater.unconsumed_tail:
+        decoded = _decode_stage(name, data, limit)
+        if decoded is None:
             return limit + 1
-        return len(out)
-    return len(raw) if len(raw) <= _OPAQUE_FILTER_RAW_LIMIT else limit + 1
+        data = decoded
+    return len(data) if len(data) <= limit else limit + 1
 
 
 class _Budget:
