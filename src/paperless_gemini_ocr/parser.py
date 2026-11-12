@@ -252,7 +252,11 @@ class GeminiOcrParser(RasterisedDocumentParser):
             for number, text in self._first_pass_texts(pages, failed).items():
                 if text.strip():
                     texts[number] = text
-            need_ocr = [n for n in failed if not texts[n].strip()]
+            if mime_type != "application/pdf":
+                # For an image the import's own run did OCR every page. For a
+                # PDF it may have skipped OCR because the file has text
+                # somewhere, so text found there proves nothing for a page.
+                need_ocr = [n for n in failed if not texts[n].strip()]
 
         if need_ocr:
             for number, text in self._ocr_failed_pages(

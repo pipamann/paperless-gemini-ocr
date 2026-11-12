@@ -54,8 +54,6 @@ _TEXT_OUTPUT_LIMIT = 64 * 1024 * 1024
 # own; next to it, a short text is not accepted as the page's text.
 _SIGNIFICANT_IMAGE = 0.2
 _MAX_ANNOTATIONS = 500
-# Objects looked at per page when checking what annotation appearances draw.
-_MAX_APPEARANCE_VISITS = 2000
 # Seconds the page analysis of one document may take; later pages then count
 # as scans without being looked at.
 _ANALYSIS_SECONDS = 120.0
@@ -378,71 +376,30 @@ def image_coverage(page) -> tuple[float, bool]:
     return min(1.0, (area + annotations) / page_area), count > 0 or annotations > 0
 
 
-def _paints_image(appearance, visits: list[int], depth: int = 0) -> bool:
-    """Whether an annotation appearance (or one of its states) draws an image.
-
-    ``visits`` is a one-element list with the objects that may still be
-    looked at for the page. Once it is used up, or the nesting gets too deep,
-    the answer is "yes": unseen is treated as content.
-    """
-    import pikepdf
-
-    if appearance is None:
-        return False
-    visits[0] -= 1
-    if visits[0] < 0 or depth > 3:
-        return True
-    if not isinstance(appearance, pikepdf.Stream):
-        # A dictionary of appearance states.
-        try:
-            return any(
-                _paints_image(appearance[key], visits, depth + 1)
-                for key in appearance.keys()
-            )
-        except Exception:
-            return True
-    resources = appearance.get("/Resources")
-    xobjects = resources.get("/XObject") if resources is not None else None
-    if xobjects is None:
-        # No resources of its own: it may use the page's, images included.
-        return resources is None
-    for key in xobjects.keys():
-        visits[0] -= 1
-        if visits[0] < 0:
-            return True
-        xobject = xobjects[key]
-        subtype = str(xobject.get("/Subtype"))
-        if subtype == "/Image":
-            return True
-        if subtype == "/Form" and _paints_image(xobject, visits, depth + 1):
-            return True
-    return False
-
-
 def _annotation_area(page, page_area: float) -> float:
     """Area of annotations that may carry page content, e.g. a scan placed as a stamp.
 
-    Form fields and links count only when their appearance draws an image:
-    an ordinary filled-in form must not look like a scan.
+    What an appearance draws is not looked into. Form fields and links count
+    by size alone: ordinary ones are small, while a field or link over a
+    fifth of the page or more may well hold an image.
     """
     annots = page.obj.get("/Annots")
     if annots is None:
         return 0.0
     area = 0.0
-    visits = [_MAX_APPEARANCE_VISITS]
     for index, annot in enumerate(annots):
         if index >= _MAX_ANNOTATIONS:
             raise _BudgetExceeded
-        appearance = annot.get("/AP")
-        if appearance is None or annot.get("/Rect") is None:
+        if annot.get("/AP") is None or annot.get("/Rect") is None:
             continue
         subtype = str(annot.get("/Subtype"))
         if subtype == "/Popup":
             continue
-        if subtype in ("/Link", "/Widget") and not _paints_image(appearance.get("/N"), visits):
-            continue
         x0, y0, x1, y1 = (float(v) for v in annot.get("/Rect"))
-        area += min(page_area, abs((x1 - x0) * (y1 - y0)))
+        own = min(page_area, abs((x1 - x0) * (y1 - y0)))
+        if subtype in ("/Link", "/Widget") and own < _SIGNIFICANT_IMAGE * page_area:
+            continue
+        area += own
     return area
 
 
@@ -494,18 +451,25 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
         for index, pdf_page in enumerate(pdf.pages):
             number = index + 1
             text = normalise_text(texts[index])
+            analysed = True
             try:
                 if time.monotonic() > give_up_at:
                     raise _BudgetExceeded
                 coverage, paints = image_coverage(pdf_page)
                 kind, reason = classify(text, coverage, paints, cfg)
             except Exception as e:
+                analysed = False
                 kind, reason = "gemini", f"page not analysable ({type(e).__name__})"
             page = Page(number=number, kind=kind, reason=reason, embedded_text=text)
             if kind == "gemini":
                 page.source_pdf = path
                 target = workdir / f"page-{number:05d}.pdf"
                 try:
+                    if not analysed:
+                        # The clean-up below reads the page content without
+                        # the limits of the analysis. A page that went past
+                        # them is rendered by pdftoppm instead (load_payload).
+                        raise AnalysisError("page was not analysable")
                     if _has_appearances(pdf_page):
                         # Annotation appearances may draw with the page's
                         # resources, which the clean-up below cannot see.

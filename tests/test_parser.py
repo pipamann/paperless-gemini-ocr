@@ -378,3 +378,12 @@ def test_fallback_pass_cannot_touch_the_archive_of_the_import(configured, monkey
         # Still the two-page archive of the import, not the one-page OCR output.
         assert len(archive.pages) == 2
     assert not (parser.tempdir / "gemini-ocr-first-pass-archive.pdf").exists()
+
+
+def test_always_mode_still_forces_ocr_for_failed_pdf_pages(configured, monkeypatch, pdf_factory):
+    """Text Paperless found somewhere in a PDF does not prove a page was OCRed."""
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_LOCAL_OCR", "always")
+    model_answers(monkeypatch, failures={2: "timeout"})
+    parser = consume(pdf_factory(["text", "scan_text"]))
+    assert configured.calls == ["auto", "force"]
+    assert parser.get_text() == "Invoice 12345 total 99.50 EUR net\n\nlocal text (force)"

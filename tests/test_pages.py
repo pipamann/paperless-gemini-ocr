@@ -393,7 +393,7 @@ def test_many_tiny_instructions_are_refused_before_parsing():
         _coverage_of(b"q Q " * 1_000_000)
 
 
-def _annotated_page(tmp_path, subtype, with_image, text="caption below the picture"):
+def _annotated_page(tmp_path, subtype, rect, inline_image=False, text="caption below the picture"):
     from pikepdf import Dictionary
     from pikepdf import Name
 
@@ -402,10 +402,15 @@ def _annotated_page(tmp_path, subtype, with_image, text="caption below the pictu
 
     pdf = pikepdf.Pdf.new()
     add_page(pdf, "text", text)
-    resources = Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf))) if with_image else Dictionary()
+    if inline_image:
+        resources = Dictionary()
+        content = b"q 595 0 0 842 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID \x80 EI Q"
+    else:
+        resources = Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf)))
+        content = b"q 595 0 0 842 0 0 cm /Im0 Do Q"
     appearance = pikepdf.Stream(
         pdf,
-        b"q 595 0 0 842 0 0 cm /Im0 Do Q" if with_image else b"0 0 m 10 10 l S",
+        content,
         Type=Name.XObject,
         Subtype=Name.Form,
         BBox=[0, 0, 595, 842],
@@ -417,7 +422,7 @@ def _annotated_page(tmp_path, subtype, with_image, text="caption below the pictu
                 Dictionary(
                     Type=Name.Annot,
                     Subtype=Name(subtype),
-                    Rect=[0, 0, 595, 842],
+                    Rect=rect,
                     AP=Dictionary(N=appearance),
                 ),
             ),
@@ -428,8 +433,10 @@ def _annotated_page(tmp_path, subtype, with_image, text="caption below the pictu
     return path
 
 
-def test_scan_inside_a_form_field_goes_to_model(tmp_path, workdir):
-    pages = analyse_pdf(_annotated_page(tmp_path, "/Widget", with_image=True), CFG, workdir)
+@pytest.mark.parametrize("inline_image", [False, True])
+def test_scan_inside_a_page_sized_form_field_goes_to_model(tmp_path, workdir, inline_image):
+    path = _annotated_page(tmp_path, "/Widget", [0, 0, 595, 842], inline_image=inline_image)
+    pages = analyse_pdf(path, CFG, workdir)
     assert kinds(pages) == ["gemini"]
     # Not exported as a PDF page: it is rendered, annotation included.
     assert pages[0].payload is None
@@ -438,8 +445,26 @@ def test_scan_inside_a_form_field_goes_to_model(tmp_path, workdir):
 
 
 def test_ordinary_form_fields_do_not_make_a_page_a_scan(tmp_path, workdir):
-    pages = analyse_pdf(_annotated_page(tmp_path, "/Widget", with_image=False), CFG, workdir)
+    pages = analyse_pdf(_annotated_page(tmp_path, "/Widget", [50, 600, 300, 620]), CFG, workdir)
     assert kinds(pages) == ["embedded"]
+
+
+def test_page_past_the_analysis_limits_is_rendered_not_exported(tmp_path, workdir):
+    """Exporting would read the page content again, without the limits."""
+    import zlib
+
+    from pikepdf import Name
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    bomb = zlib.compress(b"q Q " * 25_000_000, 9)
+    pdf.pages[0].obj["/Contents"] = pikepdf.Stream(pdf, bomb, Filter=Name.FlateDecode)
+    path = tmp_path / "bomb.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert "not analysable" in pages[0].reason
+    assert pages[0].payload is None
 
 
 def test_stream_with_predictor_is_not_looked_into():
@@ -465,28 +490,3 @@ def test_rendering_respects_the_document_time_limit(pdf_factory, workdir):
     cfg = Config(api_key="k", page_input="image")
     with pytest.raises(AnalysisError, match="time limit"):
         load_payload(pages[0], cfg, workdir, deadline=time.monotonic() + 0.5)
-
-
-def test_appearance_with_huge_nested_resources_is_bounded():
-    """Forms listing each other hundreds of times: the walk stops and says "content"."""
-    import time
-
-    from pikepdf import Dictionary
-    from pikepdf import Name
-
-    from paperless_gemini_ocr.pages import _paints_image
-
-    pdf = pikepdf.Pdf.new()
-    inner = pikepdf.Stream(pdf, b"", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 1, 1], Resources=Dictionary(XObject=Dictionary()))
-    for _ in range(3):
-        inner = pikepdf.Stream(
-            pdf,
-            b"",
-            Type=Name.XObject,
-            Subtype=Name.Form,
-            BBox=[0, 0, 1, 1],
-            Resources=Dictionary(XObject=Dictionary({f"/F{i}": inner for i in range(300)})),
-        )
-    started = time.monotonic()
-    assert _paints_image(inner, [2000]) is True
-    assert time.monotonic() - started < 5
