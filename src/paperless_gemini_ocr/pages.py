@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import time
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -35,6 +37,15 @@ _MAX_FORM_DEPTH = 6
 # included. A crafted PDF can make forms call each other with a huge fan-out;
 # past the budget the page simply counts as a scan.
 _INSTRUCTION_BUDGET = 200_000
+# Same idea for the decoded size of the content streams, checked before they
+# are parsed, so a tiny stream that inflates to gigabytes is never unpacked.
+_DECODED_BYTE_BUDGET = 32 * 1024 * 1024
+# Streams with a filter whose output size cannot be bounded cheaply are only
+# parsed while they are small.
+_OPAQUE_FILTER_RAW_LIMIT = 64 * 1024
+# Seconds the page analysis of one document may take; later pages then count
+# as scans without being looked at.
+_ANALYSIS_SECONDS = 120.0
 _IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
@@ -44,6 +55,47 @@ class AnalysisError(Exception):
 
 class _BudgetExceeded(Exception):
     """A page needs more analysis work than a real document plausibly does."""
+
+
+def _decoded_size(stream, limit: int) -> int:
+    """Decoded length of a stream, or ``limit + 1`` once it is known to be larger."""
+    import pikepdf
+
+    raw = stream.read_raw_bytes()
+    filters = stream.get("/Filter")
+    if filters is None:
+        return len(raw)
+    names = [str(filters)] if isinstance(filters, pikepdf.Name) else [str(f) for f in filters]
+    if names == ["/FlateDecode"]:
+        inflater = zlib.decompressobj()
+        try:
+            out = inflater.decompress(raw, limit + 1)
+        except zlib.error:
+            return limit + 1
+        if len(out) > limit or inflater.unconsumed_tail:
+            return limit + 1
+        return len(out)
+    return len(raw) if len(raw) <= _OPAQUE_FILTER_RAW_LIMIT else limit + 1
+
+
+class _Budget:
+    """Work one page may cause, shared by the page and all forms it paints."""
+
+    def __init__(self) -> None:
+        self.instructions = _INSTRUCTION_BUDGET
+        self.decoded_bytes = _DECODED_BYTE_BUDGET
+
+    def charge_stream(self, stream) -> None:
+        """Call before a stream is parsed."""
+        self.decoded_bytes -= _decoded_size(stream, self.decoded_bytes)
+        if self.decoded_bytes < 0:
+            raise _BudgetExceeded
+
+    def charge_instructions(self, count: int) -> None:
+        # At least one unit, so empty forms cannot be called for free.
+        self.instructions -= max(1, count)
+        if self.instructions < 0:
+            raise _BudgetExceeded
 
 
 @dataclass
@@ -143,12 +195,11 @@ def _image_area(
     ctm: tuple,
     limit: float,
     depth: int,
-    budget: list[int],
+    budget: _Budget,
 ) -> tuple[float, int]:
     """Summed area of all images a content stream paints, and its instruction count.
 
-    ``budget`` is a one-element list with the instructions still allowed for
-    the page; it is shared by all nested calls.
+    The caller has charged ``budget`` for the stream's bytes already.
     """
     import pikepdf
 
@@ -156,10 +207,7 @@ def _image_area(
     area = 0.0
     stack: list[tuple] = []
     instructions = pikepdf.parse_content_stream(stream)
-    # A form costs at least one unit, so empty forms cannot be called for free.
-    budget[0] -= max(1, len(instructions))
-    if budget[0] < 0:
-        raise _BudgetExceeded
+    budget.charge_instructions(len(instructions))
     for instruction in instructions:
         operator = str(instruction.operator)
         if operator == "q":
@@ -179,6 +227,7 @@ def _image_area(
             if subtype == "/Image":
                 area += min(limit, abs(ctm[0] * ctm[3] - ctm[1] * ctm[2]))
             elif subtype == "/Form" and depth < _MAX_FORM_DEPTH:
+                budget.charge_stream(xobject)
                 matrix = xobject.get("/Matrix")
                 inner = (
                     _concat(tuple(float(v) for v in matrix), ctm)
@@ -204,16 +253,24 @@ def image_coverage(page) -> tuple[float, bool]:
     Overlapping images are counted twice and the sum is capped at 1. That only
     errs towards "scan", which costs a model call but never loses text.
     """
+    import pikepdf
+
     page_area = _page_area(page)
     if page_area <= 0:
         return 0.0, True
+    budget = _Budget()
+    contents = page.obj.get("/Contents")
+    if contents is not None:
+        streams = [contents] if isinstance(contents, pikepdf.Stream) else list(contents)
+        for stream in streams:
+            budget.charge_stream(stream)
     area, count = _image_area(
         page,
         _inherited(page.obj, "/Resources"),
         _IDENTITY,
         page_area,
         0,
-        [_INSTRUCTION_BUDGET],
+        budget,
     )
     return min(1.0, area / page_area), count > 0
 
@@ -255,10 +312,13 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
         if texts is None or len(texts) != total:
             # Without a reliable per-page text layer every page is read by the model.
             texts = [""] * total
+        give_up_at = time.monotonic() + _ANALYSIS_SECONDS
         for index, pdf_page in enumerate(pdf.pages):
             number = index + 1
             text = normalise_text(texts[index])
             try:
+                if time.monotonic() > give_up_at:
+                    raise _BudgetExceeded
                 coverage, paints = image_coverage(pdf_page)
                 kind, reason = classify(text, coverage, paints, cfg)
             except Exception as e:

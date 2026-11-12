@@ -1,0 +1,48 @@
+# Throwaway stack for the integration tests: Paperless-ngx with the plugin
+# installed the documented way, and a stand-in for the Gemini API.
+services:
+  broker:
+    image: redis:7
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD: paperless
+
+  fake-gemini:
+    image: python:3.13-slim
+    command: python -u /app/fake_gemini.py
+    volumes:
+      - ./fake_gemini.py:/app/fake_gemini.py:ro
+
+  webserver:
+    image: ghcr.io/paperless-ngx/paperless-ngx:${IT_PAPERLESS_VERSION:-3.4.2}
+    depends_on:
+      - db
+      - broker
+      - fake-gemini
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./plugins:/custom-cont-init.d:ro
+      - ./:/it:ro
+      - ./results:/results
+      - consume:/usr/src/paperless/consume
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBHOST: db
+      PAPERLESS_DBPASS: paperless
+      PAPERLESS_ADMIN_USER: admin
+      PAPERLESS_ADMIN_PASSWORD: integration-test
+      PAPERLESS_OCR_LANGUAGE: deu+eng
+      PAPERLESS_TASK_WORKERS: 4
+      PAPERLESS_CONSUMER_RECURSIVE: "true"
+      PAPERLESS_GEMINI_OCR_API_KEY: ${IT_API_KEY-not-a-real-key}
+      PAPERLESS_GEMINI_OCR_BASE_URL: http://fake-gemini:8080/v1beta
+      PAPERLESS_GEMINI_OCR_LOCAL_OCR: ${IT_LOCAL_OCR:-fallback}
+      PAPERLESS_REMOTE_OCR_MODE: ${IT_REMOTE_OCR_MODE:-always}
+
+volumes:
+  consume:

@@ -171,3 +171,40 @@ def test_nested_forms_with_huge_fan_out_stop_at_the_budget():
     with pytest.raises(_BudgetExceeded):
         image_coverage(page)
     assert time.monotonic() - started < 20
+
+
+def test_stream_that_inflates_hugely_is_never_unpacked():
+    """100 kB that inflate to 100 MB of operators: refused before parsing."""
+    import time
+    import zlib
+
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+    from paperless_gemini_ocr.pages import image_coverage
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    bomb = zlib.compress(b"q Q " * 25_000_000, 9)
+    assert len(bomb) < 200_000
+    pdf.pages[0].obj["/Contents"] = pikepdf.Stream(pdf, bomb, Filter=Name.FlateDecode)
+
+    started = time.monotonic()
+    with pytest.raises(_BudgetExceeded):
+        image_coverage(pdf.pages[0])
+    assert time.monotonic() - started < 5
+
+
+def test_contents_array_and_compressed_streams_still_work(pdf_factory, workdir, tmp_path):
+    """Real PDFs split and compress their content streams."""
+    source = pdf_factory(["scan"])
+    target = tmp_path / "split.pdf"
+    with pikepdf.open(source) as pdf:
+        page = pdf.pages[0]
+        page.obj["/Contents"] = pikepdf.Array(
+            [pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm"), pikepdf.Stream(pdf, b"/Im0 Do Q")],
+        )
+        pdf.save(target, compress_streams=True)
+    pages = analyse_pdf(target, CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    assert pages[0].reason.startswith("scan")
