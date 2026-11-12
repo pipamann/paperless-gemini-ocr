@@ -138,3 +138,36 @@ def test_unreadable_pdf_raises(tmp_path, workdir):
     path.write_bytes(b"this is not a pdf")
     with pytest.raises(AnalysisError):
         analyse_pdf(path, CFG, workdir)
+
+
+def test_nested_forms_with_huge_fan_out_stop_at_the_budget():
+    """Six levels of forms, each calling the next 60 times: 60^6 calls if unbounded."""
+    import time
+
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+    from paperless_gemini_ocr.pages import image_coverage
+
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    calls = b"/Fm0 Do " * 60
+    inner = pikepdf.Stream(pdf, b"", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 1, 1])
+    for _ in range(6):
+        inner = pikepdf.Stream(
+            pdf,
+            calls,
+            Type=Name.XObject,
+            Subtype=Name.Form,
+            BBox=[0, 0, 1, 1],
+            Resources=Dictionary(XObject=Dictionary(Fm0=inner)),
+        )
+    page = pdf.pages[0]
+    page.obj["/Resources"] = Dictionary(XObject=Dictionary(Fm0=inner))
+    page.obj["/Contents"] = pikepdf.Stream(pdf, calls)
+
+    started = time.monotonic()
+    with pytest.raises(_BudgetExceeded):
+        image_coverage(page)
+    assert time.monotonic() - started < 20

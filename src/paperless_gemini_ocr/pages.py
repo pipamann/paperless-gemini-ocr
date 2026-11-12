@@ -31,11 +31,19 @@ GEMINI_IMAGE_TYPES = frozenset(
 # Inline requests are limited to 20 MB; base64 adds a third.
 MAX_INLINE_BYTES = 14 * 1024 * 1024
 _MAX_FORM_DEPTH = 6
+# Upper bound on the drawing instructions looked at per page, nested forms
+# included. A crafted PDF can make forms call each other with a huge fan-out;
+# past the budget the page simply counts as a scan.
+_INSTRUCTION_BUDGET = 200_000
 _IDENTITY = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
 class AnalysisError(Exception):
     """The document could not be taken apart; the caller falls back to local OCR."""
+
+
+class _BudgetExceeded(Exception):
+    """A page needs more analysis work than a real document plausibly does."""
 
 
 @dataclass
@@ -82,7 +90,7 @@ def pdf_page_texts(path: Path) -> list[str] | None:
             ["pdftotext", "-q", "-layout", "-enc", "UTF-8", str(path), "-"],
             capture_output=True,
             check=True,
-            timeout=300,
+            timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("pdftotext failed: %s", type(e).__name__)
@@ -129,14 +137,29 @@ def _page_area(page) -> float:
     return abs((x1 - x0) * (y1 - y0))
 
 
-def _image_area(stream, resources, ctm: tuple, limit: float, depth: int) -> tuple[float, int]:
-    """Summed area of all images a content stream paints, and its instruction count."""
+def _image_area(
+    stream,
+    resources,
+    ctm: tuple,
+    limit: float,
+    depth: int,
+    budget: list[int],
+) -> tuple[float, int]:
+    """Summed area of all images a content stream paints, and its instruction count.
+
+    ``budget`` is a one-element list with the instructions still allowed for
+    the page; it is shared by all nested calls.
+    """
     import pikepdf
 
     xobjects = resources.get("/XObject") if resources is not None else None
     area = 0.0
     stack: list[tuple] = []
     instructions = pikepdf.parse_content_stream(stream)
+    # A form costs at least one unit, so empty forms cannot be called for free.
+    budget[0] -= max(1, len(instructions))
+    if budget[0] < 0:
+        raise _BudgetExceeded
     for instruction in instructions:
         operator = str(instruction.operator)
         if operator == "q":
@@ -169,6 +192,7 @@ def _image_area(stream, resources, ctm: tuple, limit: float, depth: int) -> tupl
                     inner,
                     limit,
                     depth + 1,
+                    budget,
                 )
                 area += sub_area
     return area, len(instructions)
@@ -189,6 +213,7 @@ def image_coverage(page) -> tuple[float, bool]:
         _IDENTITY,
         page_area,
         0,
+        [_INSTRUCTION_BUDGET],
     )
     return min(1.0, area / page_area), count > 0
 
