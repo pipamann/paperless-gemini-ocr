@@ -355,3 +355,26 @@ def test_rotation_can_be_switched_off(configured, monkeypatch, pdf_factory):
     parser = consume(pdf_factory(["scan"]))
     with pikepdf.open(parser.archive_path) as archive:
         assert "/Rotate" not in archive.pages[0].obj
+
+
+def test_first_ocr_run_is_kept_when_tesseract_always_runs(configured, monkeypatch, tmp_path):
+    """LOCAL_OCR=always: the import's own OCR text is the fallback, no second pass."""
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_LOCAL_OCR", "always")
+    configured.fail_modes = {"force"}
+    path = tmp_path / "scan.jpg"
+    Image.new("RGB", (60, 80), "white").save(path, "JPEG")
+    model_answers(monkeypatch, failures={1: "timeout"})
+    parser = consume(path, "image/jpeg")
+    assert configured.calls == ["auto"]
+    assert parser.get_text() == "local text (auto)"
+
+
+def test_fallback_pass_cannot_touch_the_archive_of_the_import(configured, monkeypatch, pdf_factory):
+    """The forced pass works in a parser of its own, with its own folder."""
+    model_answers(monkeypatch, failures={1: "timeout"})
+    source = pdf_factory(["scan", "scan"])
+    parser = consume(source)
+    with pikepdf.open(parser.archive_path) as archive:
+        # Still the two-page archive of the import, not the one-page OCR output.
+        assert len(archive.pages) == 2
+    assert not (parser.tempdir / "gemini-ocr-first-pass-archive.pdf").exists()

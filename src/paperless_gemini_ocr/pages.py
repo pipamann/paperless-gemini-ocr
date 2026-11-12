@@ -125,6 +125,10 @@ def _decoded(stream, limit: int) -> bytes | None:
     """
     import pikepdf
 
+    if stream.get("/DecodeParms") is not None or stream.get("/DP") is not None:
+        # Predictors and the like change the bytes after decoding; a content
+        # stream has no use for them, so such a stream is not looked into.
+        return None
     data = stream.read_raw_bytes()
     filters = stream.get("/Filter")
     if filters is None:
@@ -372,8 +376,37 @@ def image_coverage(page) -> tuple[float, bool]:
     return min(1.0, (area + annotations) / page_area), count > 0 or annotations > 0
 
 
+def _paints_image(appearance, depth: int = 0) -> bool:
+    """Whether an annotation appearance (or one of its states) draws an image."""
+    import pikepdf
+
+    if appearance is None or depth > 3:
+        return False
+    if not isinstance(appearance, pikepdf.Stream):
+        # A dictionary of appearance states.
+        try:
+            return any(_paints_image(appearance[key], depth + 1) for key in appearance.keys())
+        except Exception:
+            return True
+    resources = appearance.get("/Resources")
+    xobjects = resources.get("/XObject") if resources is not None else None
+    if xobjects is None:
+        # No resources of its own: it may use the page's, images included.
+        return resources is None
+    for key in xobjects.keys():
+        xobject = xobjects[key]
+        subtype = str(xobject.get("/Subtype"))
+        if subtype == "/Image" or (subtype == "/Form" and _paints_image(xobject, depth + 1)):
+            return True
+    return False
+
+
 def _annotation_area(page, page_area: float) -> float:
-    """Area of annotations that paint something, e.g. a scan placed as a stamp."""
+    """Area of annotations that may carry page content, e.g. a scan placed as a stamp.
+
+    Form fields and links count only when their appearance draws an image:
+    an ordinary filled-in form must not look like a scan.
+    """
     annots = page.obj.get("/Annots")
     if annots is None:
         return 0.0
@@ -381,18 +414,24 @@ def _annotation_area(page, page_area: float) -> float:
     for index, annot in enumerate(annots):
         if index >= _MAX_ANNOTATIONS:
             raise _BudgetExceeded
-        if str(annot.get("/Subtype")) in ("/Link", "/Popup", "/Widget"):
+        appearance = annot.get("/AP")
+        if appearance is None or annot.get("/Rect") is None:
             continue
-        if annot.get("/AP") is None or annot.get("/Rect") is None:
+        subtype = str(annot.get("/Subtype"))
+        if subtype == "/Popup":
+            continue
+        if subtype in ("/Link", "/Widget") and not _paints_image(appearance.get("/N")):
             continue
         x0, y0, x1, y1 = (float(v) for v in annot.get("/Rect"))
         area += min(page_area, abs((x1 - x0) * (y1 - y0)))
     return area
 
 
-# ---------------------------------------------------------------------------
-# PDFs
-# ---------------------------------------------------------------------------
+def _has_appearances(page) -> bool:
+    annots = page.obj.get("/Annots")
+    if annots is None:
+        return False
+    return any(annot.get("/AP") is not None for annot in annots)
 
 
 def classify(text: str, coverage: float, paints: bool, cfg: Config) -> tuple[str, str]:
@@ -448,6 +487,11 @@ def analyse_pdf(path: Path, cfg: Config, workdir: Path) -> list[Page]:
                 page.source_pdf = path
                 target = workdir / f"page-{number:05d}.pdf"
                 try:
+                    if _has_appearances(pdf_page):
+                        # Annotation appearances may draw with the page's
+                        # resources, which the clean-up below cannot see.
+                        # Such a page is rendered instead (load_payload).
+                        raise AnalysisError("page has annotation appearances")
                     single = pikepdf.Pdf.new()
                     single.pages.append(pdf_page)
                     # Pages often share one resource dictionary. Without this
@@ -557,9 +601,12 @@ def load_payload(
     page: Page,
     cfg: Config,
     workdir: Path,
-    timeout: float = 180.0,
+    deadline: float | None = None,
 ) -> tuple[bytes, str]:
-    """Bytes and MIME type to send for a page. Safe to call from worker threads."""
+    """Bytes and MIME type to send for a page. Safe to call from worker threads.
+
+    ``deadline`` is a ``time.monotonic()`` value; rendering never runs past it.
+    """
     is_pdf_page = page.source_pdf is not None
     use_file = (
         page.payload is not None
@@ -572,6 +619,11 @@ def load_payload(
         raise AnalysisError("page too large to upload")
     dpi = cfg.render_dpi
     for _ in range(3):
+        timeout = 180.0
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 1:
+                raise AnalysisError("document time limit reached while rendering")
         rendered = render_page(page.source_pdf, page.number, dpi, workdir, timeout)
         if rendered.stat().st_size <= MAX_INLINE_BYTES:
             return rendered.read_bytes(), "image/jpeg"

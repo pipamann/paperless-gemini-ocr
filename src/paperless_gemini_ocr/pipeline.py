@@ -90,7 +90,7 @@ def read_pages(
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             raise GeminiError("document time limit reached", retryable=False, attempts=0)
-        data, mime_type = load_payload(page, cfg, workdir, timeout=remaining)
+        data, mime_type = load_payload(page, cfg, workdir, deadline)
         return client.transcribe(data, mime_type, prompt, deadline)
 
     try:

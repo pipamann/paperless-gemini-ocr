@@ -391,3 +391,77 @@ def test_many_tiny_instructions_are_refused_before_parsing():
 
     with pytest.raises(_BudgetExceeded):
         _coverage_of(b"q Q " * 1_000_000)
+
+
+def _annotated_page(tmp_path, subtype, with_image, text="caption below the picture"):
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from .conftest import _image_xobject
+    from .conftest import add_page
+
+    pdf = pikepdf.Pdf.new()
+    add_page(pdf, "text", text)
+    resources = Dictionary(XObject=Dictionary(Im0=_image_xobject(pdf))) if with_image else Dictionary()
+    appearance = pikepdf.Stream(
+        pdf,
+        b"q 595 0 0 842 0 0 cm /Im0 Do Q" if with_image else b"0 0 m 10 10 l S",
+        Type=Name.XObject,
+        Subtype=Name.Form,
+        BBox=[0, 0, 595, 842],
+        Resources=resources,
+    )
+    pdf.pages[0].obj["/Annots"] = pikepdf.Array(
+        [
+            pdf.make_indirect(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name(subtype),
+                    Rect=[0, 0, 595, 842],
+                    AP=Dictionary(N=appearance),
+                ),
+            ),
+        ],
+    )
+    path = tmp_path / "annotated.pdf"
+    pdf.save(path)
+    return path
+
+
+def test_scan_inside_a_form_field_goes_to_model(tmp_path, workdir):
+    pages = analyse_pdf(_annotated_page(tmp_path, "/Widget", with_image=True), CFG, workdir)
+    assert kinds(pages) == ["gemini"]
+    # Not exported as a PDF page: it is rendered, annotation included.
+    assert pages[0].payload is None
+    data, mime = load_payload(pages[0], Config(api_key="k", render_dpi=72), workdir)
+    assert mime == "image/jpeg"
+
+
+def test_ordinary_form_fields_do_not_make_a_page_a_scan(tmp_path, workdir):
+    pages = analyse_pdf(_annotated_page(tmp_path, "/Widget", with_image=False), CFG, workdir)
+    assert kinds(pages) == ["embedded"]
+
+
+def test_stream_with_predictor_is_not_looked_into():
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _BudgetExceeded
+
+    with pytest.raises(_BudgetExceeded):
+        _coverage_of(
+            b"x\x9c+T\x08\x04\x00\x01\xe5\x00\xf3",
+            Filter=Name.FlateDecode,
+            DecodeParms=Dictionary(Predictor=2),
+        )
+
+
+def test_rendering_respects_the_document_time_limit(pdf_factory, workdir):
+    import time
+
+    from paperless_gemini_ocr.pages import AnalysisError
+
+    pages = analyse_pdf(pdf_factory(["scan"]), CFG, workdir)
+    cfg = Config(api_key="k", page_input="image")
+    with pytest.raises(AnalysisError, match="time limit"):
+        load_payload(pages[0], cfg, workdir, deadline=time.monotonic() + 0.5)
