@@ -54,6 +54,8 @@ _TEXT_OUTPUT_LIMIT = 64 * 1024 * 1024
 # own; next to it, a short text is not accepted as the page's text.
 _SIGNIFICANT_IMAGE = 0.2
 _MAX_ANNOTATIONS = 500
+# Objects looked at per page when checking what annotation appearances draw.
+_MAX_APPEARANCE_VISITS = 2000
 # Seconds the page analysis of one document may take; later pages then count
 # as scans without being looked at.
 _ANALYSIS_SECONDS = 120.0
@@ -376,16 +378,27 @@ def image_coverage(page) -> tuple[float, bool]:
     return min(1.0, (area + annotations) / page_area), count > 0 or annotations > 0
 
 
-def _paints_image(appearance, depth: int = 0) -> bool:
-    """Whether an annotation appearance (or one of its states) draws an image."""
+def _paints_image(appearance, visits: list[int], depth: int = 0) -> bool:
+    """Whether an annotation appearance (or one of its states) draws an image.
+
+    ``visits`` is a one-element list with the objects that may still be
+    looked at for the page. Once it is used up, or the nesting gets too deep,
+    the answer is "yes": unseen is treated as content.
+    """
     import pikepdf
 
-    if appearance is None or depth > 3:
+    if appearance is None:
         return False
+    visits[0] -= 1
+    if visits[0] < 0 or depth > 3:
+        return True
     if not isinstance(appearance, pikepdf.Stream):
         # A dictionary of appearance states.
         try:
-            return any(_paints_image(appearance[key], depth + 1) for key in appearance.keys())
+            return any(
+                _paints_image(appearance[key], visits, depth + 1)
+                for key in appearance.keys()
+            )
         except Exception:
             return True
     resources = appearance.get("/Resources")
@@ -394,9 +407,14 @@ def _paints_image(appearance, depth: int = 0) -> bool:
         # No resources of its own: it may use the page's, images included.
         return resources is None
     for key in xobjects.keys():
+        visits[0] -= 1
+        if visits[0] < 0:
+            return True
         xobject = xobjects[key]
         subtype = str(xobject.get("/Subtype"))
-        if subtype == "/Image" or (subtype == "/Form" and _paints_image(xobject, depth + 1)):
+        if subtype == "/Image":
+            return True
+        if subtype == "/Form" and _paints_image(xobject, visits, depth + 1):
             return True
     return False
 
@@ -411,6 +429,7 @@ def _annotation_area(page, page_area: float) -> float:
     if annots is None:
         return 0.0
     area = 0.0
+    visits = [_MAX_APPEARANCE_VISITS]
     for index, annot in enumerate(annots):
         if index >= _MAX_ANNOTATIONS:
             raise _BudgetExceeded
@@ -420,7 +439,7 @@ def _annotation_area(page, page_area: float) -> float:
         subtype = str(annot.get("/Subtype"))
         if subtype == "/Popup":
             continue
-        if subtype in ("/Link", "/Widget") and not _paints_image(appearance.get("/N")):
+        if subtype in ("/Link", "/Widget") and not _paints_image(appearance.get("/N"), visits):
             continue
         x0, y0, x1, y1 = (float(v) for v in annot.get("/Rect"))
         area += min(page_area, abs((x1 - x0) * (y1 - y0)))

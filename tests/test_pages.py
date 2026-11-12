@@ -465,3 +465,28 @@ def test_rendering_respects_the_document_time_limit(pdf_factory, workdir):
     cfg = Config(api_key="k", page_input="image")
     with pytest.raises(AnalysisError, match="time limit"):
         load_payload(pages[0], cfg, workdir, deadline=time.monotonic() + 0.5)
+
+
+def test_appearance_with_huge_nested_resources_is_bounded():
+    """Forms listing each other hundreds of times: the walk stops and says "content"."""
+    import time
+
+    from pikepdf import Dictionary
+    from pikepdf import Name
+
+    from paperless_gemini_ocr.pages import _paints_image
+
+    pdf = pikepdf.Pdf.new()
+    inner = pikepdf.Stream(pdf, b"", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 1, 1], Resources=Dictionary(XObject=Dictionary()))
+    for _ in range(3):
+        inner = pikepdf.Stream(
+            pdf,
+            b"",
+            Type=Name.XObject,
+            Subtype=Name.Form,
+            BBox=[0, 0, 1, 1],
+            Resources=Dictionary(XObject=Dictionary({f"/F{i}": inner for i in range(300)})),
+        )
+    started = time.monotonic()
+    assert _paints_image(inner, [2000]) is True
+    assert time.monotonic() - started < 5
