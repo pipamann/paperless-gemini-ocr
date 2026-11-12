@@ -228,17 +228,104 @@ def looks_broken(text: str) -> bool:
     return bad / len(text) > 0.1
 
 
-# Words of three letters or more from which local OCR output counts as text.
-# Specks, punch holes and scanner streaks give a few stray characters at most.
-_TEXT_WORDS = 3
+# When local OCR output counts as text: at least this many words of three
+# letters or more, and at least this share of its characters inside such words
+# or inside numbers. A blank page with scanner specks makes OCR emit hundreds
+# of stray marks with a few accidental "words" between them; real text is
+# mostly words. Measured on scans: noise 0.13-0.15, printed pages 0.78-0.97.
+_TEXT_WORDS = 5
+_TEXT_SHARE = 0.35
 _WORD = re.compile(r"[^\W\d_]{3,}")
+_NUMBER = re.compile(r"\d[\d.,]*\d")
+# The quick look at a page the model calls empty: resolution for a PDF page
+# (small print has to survive), bounds for the longer edge in pixels, the
+# edge for an image, whose paper size is unknown, and the seconds each step
+# gets.
+_PROBE_DPI = 150
+_PROBE_MIN_EDGE = 1200
+_PROBE_MAX_EDGE = 3000
+_PROBE_IMAGE_EDGE = 2400
+_PROBE_SECONDS = 30.0
+_LANGUAGES = re.compile(r"^[A-Za-z0-9_]+(\+[A-Za-z0-9_]+)*$")
 
 
 def reads_like_text(text: str | None) -> bool:
     """Whether OCR output is more than the noise an empty page produces."""
     if not text:
         return False
-    return sum(1 for _ in _WORD.finditer(text)) >= _TEXT_WORDS
+    words = [m.group() for m in _WORD.finditer(text)]
+    if len(words) < _TEXT_WORDS:
+        return False
+    solid = sum(len(w) for w in words) + sum(len(m.group()) for m in _NUMBER.finditer(text))
+    total = sum(1 for ch in text if not ch.isspace())
+    return solid / total >= _TEXT_SHARE
+
+
+def probe_text(page: Page, workdir: Path, languages: str | None) -> str | None:
+    """What Tesseract sees on a page at low resolution, or None if it could not look.
+
+    A quick second opinion on a page the model calls empty: a second or two
+    per page. Tesseract is called directly on a grey rendering of moderate
+    size; the full OCR pipeline turned the specks of a blank scan into text
+    and took minutes over it. The result only answers "is there text"; it is
+    not good enough to be kept.
+    """
+    if not languages or not _LANGUAGES.match(languages):
+        languages = "eng"
+    target = workdir / f"probe-{page.number:05d}.png"
+    try:
+        if page.source_pdf is not None:
+            wanted = round((page.long_edge if page.long_edge > 0 else 842.0) / 72 * _PROBE_DPI)
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-q",
+                    "-scale-to",
+                    str(max(_PROBE_MIN_EDGE, min(_PROBE_MAX_EDGE, wanted))),
+                    "-gray",
+                    "-png",
+                    "-f",
+                    str(page.number),
+                    "-l",
+                    str(page.number),
+                    "-singlefile",
+                    str(page.source_pdf),
+                    str(target.with_suffix("")),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=_PROBE_SECONDS,
+            )
+        elif page.payload is not None:
+            from PIL import Image
+
+            with Image.open(page.payload) as image:
+                if image.width * image.height > _MAX_FRAME_PIXELS:
+                    return None
+                # JPEG can be decoded at a fraction of its size straight away.
+                image.draft("L", (_PROBE_IMAGE_EDGE, _PROBE_IMAGE_EDGE))
+                small = _upright_rgb(image)
+                small.thumbnail((_PROBE_IMAGE_EDGE, _PROBE_IMAGE_EDGE))
+                small.convert("L").save(target, "PNG")
+        else:
+            return None
+        result = subprocess.run(
+            ["tesseract", str(target), "stdout", "-l", languages],
+            capture_output=True,
+            timeout=_PROBE_SECONDS,
+            # One thread: several imports run side by side.
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+        )
+        # Tesseract carries on without a language it cannot load and still
+        # exits with 0; what it then fails to see proves nothing.
+        if result.returncode != 0 or b"Failed loading language" in result.stderr:
+            return None
+        return result.stdout.decode("utf-8", "replace")
+    except Exception as e:
+        logger.debug("Probe of page %d failed: %s", page.number, type(e).__name__)
+        return None
+    finally:
+        _discard(target)
 
 
 def pdf_page_texts(path: Path) -> list[str] | None:

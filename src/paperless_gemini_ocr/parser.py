@@ -37,6 +37,7 @@ from .pages import analyse_pdf
 from .pages import normalise_text
 from .pages import pdf_page_texts
 from .pages import prepare_image
+from .pages import probe_text
 from .pages import reads_like_text
 from .pipeline import DocumentResult
 from .pipeline import assemble
@@ -144,16 +145,10 @@ class GeminiOcrParser(RasterisedDocumentParser):
             finally:
                 outcome = self._collect(future, scan_pages)
 
-        local_texts: dict[int, str] = {}
         if not outcome.failures or in_consume:
-            # Not worth the OCR run when a reprocess is refused anyway.
-            local_texts = self._check_empty_pages(
-                document_path,
-                mime_type,
-                pages,
-                outcome,
-                first_pass_had_ocr=archive_from_ocr,
-            )
+            # Not worth the look when a reprocess is refused anyway.
+            self._check_empty_pages(pages, outcome, workdir, first_pass_had_ocr=archive_from_ocr)
+        local_texts: dict[int, str] = {}
         if outcome.failures:
             if not in_consume:
                 raise ParseError(
@@ -161,16 +156,13 @@ class GeminiOcrParser(RasterisedDocumentParser):
                     f"{', '.join(str(n) for n in sorted(outcome.failures))}; "
                     "content left unchanged",
                 )
-            unread = [n for n in sorted(outcome.failures) if n not in local_texts]
-            if unread:
-                texts, _ = self._local_texts(
-                    document_path,
-                    mime_type,
-                    pages,
-                    unread,
-                    first_pass_had_ocr=archive_from_ocr,
-                )
-                local_texts.update(texts)
+            local_texts = self._local_texts(
+                document_path,
+                mime_type,
+                pages,
+                sorted(outcome.failures),
+                first_pass_had_ocr=archive_from_ocr,
+            )
             state.set_report(
                 state.Report(total_pages=len(pages), failures=dict(outcome.failures)),
             )
@@ -264,47 +256,47 @@ class GeminiOcrParser(RasterisedDocumentParser):
 
     def _check_empty_pages(
         self,
-        document_path: Path,
-        mime_type: str,
         pages: list[Page],
         outcome: DocumentResult,
+        workdir: Path,
         *,
         first_pass_had_ocr: bool,
-    ) -> dict[int, str]:
-        """Have local OCR look at the pages the model calls empty.
+    ) -> None:
+        """Have Tesseract take a quick look at the pages the model calls empty.
 
         An empty answer for a page full of text would otherwise be imported
-        as an empty page without anyone noticing. Where local OCR does find
-        text, or could not look at the page at all, the page counts as
-        failed: it gets the local text and the document is flagged. Returns
-        the text of those pages. With local OCR switched off the model's word
-        is all there is.
+        as an empty page without anyone noticing. Where text is already at
+        hand (the page's own layer, the import's own OCR run), the look
+        finds some, or the look was not possible, the page is moved to the
+        failed ones: it gets local text like any other failed page and the
+        document is flagged. With local OCR switched off the model's word is
+        all there is.
         """
         from paperless.models import ModeChoices
 
         empty = sorted(n for n, r in outcome.results.items() if not r.text.strip())
         if not empty or self.settings.mode == ModeChoices.OFF:
-            return {}
-        texts, looked_at = self._local_texts(
-            document_path,
-            mime_type,
-            pages,
-            empty,
-            first_pass_had_ocr=first_pass_had_ocr,
-        )
-        doubted: dict[int, str] = {}
+            return
+        by_number = {p.number: p for p in pages}
+        languages = getattr(self.settings, "language", None)
+        at_hand = self._first_pass_texts(pages, empty) if first_pass_had_ocr else {}
         for number in empty:
-            if reads_like_text(texts[number]):
-                reason = "the model found no text on the page, local OCR did"
-            elif number not in looked_at:
+            if reads_like_text(by_number[number].embedded_text) or reads_like_text(
+                at_hand.get(number),
+            ):
+                outcome.failures[number] = "the model found no text on a page that has some"
+                del outcome.results[number]
+                continue
+            seen = probe_text(by_number[number], workdir, languages)
+            if seen is None:
                 # Not the same as an empty page: nobody has confirmed it.
                 reason = "the model found no text on the page, local OCR could not check it"
+            elif reads_like_text(seen):
+                reason = "the model found no text on the page, local OCR did"
             else:
                 continue
-            doubted[number] = texts[number]
             del outcome.results[number]
             outcome.failures[number] = reason
-        return doubted
 
     def _local_texts(
         self,
@@ -314,19 +306,16 @@ class GeminiOcrParser(RasterisedDocumentParser):
         failed: list[int],
         *,
         first_pass_had_ocr: bool,
-    ) -> tuple[dict[int, str], set[int]]:
-        """Best local text for exactly the given pages, and which of them OCR saw.
+    ) -> dict[int, str]:
+        """Best local text for exactly the given pages (the model failed on them).
 
         In rising order of preference: the text layer the page brought along
         (a scanner's own, for instance), what the import's own OCR run found,
         and a forced OCR pass over the pages that still have nothing better.
         A later source does not replace real text by a few stray characters.
-        The second value holds the pages an OCR run has a result for, empty
-        or not; for the others nothing is known.
         """
         by_number = {p.number: p for p in pages}
         texts = {n: by_number[n].embedded_text for n in failed}
-        looked_at: set[int] = set()
 
         def take(number: int, text: str) -> None:
             if text.strip() and not (reads_like_text(texts[number]) and not reads_like_text(text)):
@@ -341,7 +330,6 @@ class GeminiOcrParser(RasterisedDocumentParser):
                 # For an image the import's own run did OCR every page. For a
                 # PDF it may have skipped OCR because the file has text
                 # somewhere, so text found there proves nothing for a page.
-                looked_at.update(first_pass)
                 need_ocr = [n for n in failed if not texts[n].strip()]
 
         if need_ocr:
@@ -351,9 +339,8 @@ class GeminiOcrParser(RasterisedDocumentParser):
                 need_ocr,
                 by_number,
             ).items():
-                looked_at.add(number)
                 take(number, text)
-        return texts, looked_at
+        return texts
 
     def _first_pass_texts(self, pages: list[Page], failed: list[int]) -> dict[int, str]:
         """Text the import's own OCR run produced, per failed page."""

@@ -307,8 +307,9 @@ def functional() -> None:
 
     # --- model down: import succeeds with local OCR, document flagged
     control(mode="fail")
-    marker = uid()
-    data = scan_pdf([page_image(letter(f"{marker}-{n}")) for n in (1, 2)])
+    # Words as marks: Tesseract misreads about one random number in ten.
+    first, second = "Elster", "Fuchs"
+    data = scan_pdf([page_image(letter(mark)) for mark in (first, second)])
     started = time.monotonic()
     doc = document(consume("model-down", "pdf", data)["id"])
     elapsed = time.monotonic() - started
@@ -316,7 +317,7 @@ def functional() -> None:
     doc_notes = notes(doc["id"])
     check("model down: document imported anyway", True, f"{elapsed:.0f} s")
     check("model down: content is local OCR", "FAKE-OCR" not in doc["content"] and "Musterfirma" in doc["content"], doc["content"][:200])
-    check("model down: both pages in page order", doc["content"].find(f"{marker}-1") < doc["content"].find(f"{marker}-2") and f"{marker}-1" in doc["content"], doc["content"][:300])
+    check("model down: both pages in page order", -1 < doc["content"].find(first) < doc["content"].find(second), doc["content"][:300])
     check("model down: tagged ocr-review", tag is not None and tag in doc["tags"], f"tag={tag} tags={doc['tags']}")
     check("model down: note names the pages", any("page(s) 1, 2 of 2" in n for n in doc_notes), doc_notes)
     check("model down: three attempts per page", stats()["requests"] == 6, stats())

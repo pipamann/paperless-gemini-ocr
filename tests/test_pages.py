@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pikepdf
 import pytest
 from PIL import Image
@@ -11,6 +13,7 @@ from paperless_gemini_ocr.pages import load_payload
 from paperless_gemini_ocr.pages import looks_broken
 from paperless_gemini_ocr.pages import normalise_text
 from paperless_gemini_ocr.pages import prepare_image
+from paperless_gemini_ocr.pages import probe_text
 from paperless_gemini_ocr.pages import reads_like_text
 
 CFG = Config(api_key="k")
@@ -773,7 +776,10 @@ def test_forms_sharing_the_page_resources_can_still_be_exported(tmp_path, workdi
         (None, False),
         (" . | — ,, 1 7 ii", False),
         ("Seite 3 von 5", False),
-        ("Invoice 12345 total 99.50 EUR net", True),
+        ("Invoice 12345 total 99.50 EUR net", False),
+        ("Invoice 12345 of the Example Company, total 99.50 EUR net", True),
+        # What a full OCR run made of two blank, speckled scan pages.
+        ((Path(__file__).parent / "noise_sample.txt").read_text(encoding="utf-8"), False),
         ("Sehr geehrte Damen und Herren, anbei die Rechnung", True),
         ("חשבונית מספר שלוש מאות עשרים וחמש", True),
     ],
@@ -816,3 +822,157 @@ def test_page_copy_too_large_to_send_is_not_kept(pdf_factory, workdir, monkeypat
     assert pages[0].kind == "gemini"
     assert pages[0].payload is None
     assert list(workdir.glob("page-*")) == []
+
+
+needs_tesseract = pytest.mark.skipif(
+    __import__("shutil").which("tesseract") is None,
+    reason="tesseract is not installed",
+)
+
+
+def written_page(lines):
+    from PIL import ImageDraw
+    from PIL import ImageFont
+
+    image = Image.new("RGB", (1654, 2339), "white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=44)
+    for index, line in enumerate(lines):
+        draw.text((150, 200 + 90 * index), line, fill="black", font=font)
+    return image
+
+
+LINES = [
+    "Example Company Limited, 12 Sample Road",
+    "Invoice number 2026-4711 for the delivery in October",
+    "Total amount 486.12 Euro, payable within fourteen days",
+    "With kind regards, the accounting department",
+]
+
+
+@needs_tesseract
+def test_quick_look_finds_text_on_an_image(tmp_path, workdir):
+    path = tmp_path / "letter.jpg"
+    written_page(LINES).save(path, "JPEG")
+    pages = prepare_image(path, "image/jpeg", workdir)
+    seen = probe_text(pages[0], workdir, "eng")
+    assert reads_like_text(seen)
+    assert "Invoice" in seen
+    assert list(workdir.glob("probe-*")) == []
+
+
+@needs_tesseract
+def test_quick_look_finds_nothing_on_a_speckled_blank_page(tmp_path, workdir):
+    import random
+
+    image = Image.new("L", (1654, 2339), 255)
+    rng = random.Random(7)
+    for _ in range(6000):
+        image.putpixel((rng.randrange(1654), rng.randrange(2339)), rng.randrange(60, 160))
+    path = tmp_path / "blank.png"
+    image.save(path, "PNG")
+    pages = prepare_image(path, "image/png", workdir)
+    seen = probe_text(pages[0], workdir, "eng")
+    assert seen is not None
+    assert not reads_like_text(seen)
+
+
+@needs_tesseract
+def test_quick_look_reads_a_pdf_page(tmp_path, workdir):
+    import io
+
+    buffer = io.BytesIO()
+    written_page(LINES).save(buffer, "JPEG")
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(595, 842))
+    pdf.add_blank_page(page_size=(595, 842))
+    image = pikepdf.Stream(
+        pdf,
+        buffer.getvalue(),
+        Type=pikepdf.Name.XObject,
+        Subtype=pikepdf.Name.Image,
+        Width=1654,
+        Height=2339,
+        ColorSpace=pikepdf.Name.DeviceRGB,
+        BitsPerComponent=8,
+        Filter=pikepdf.Name.DCTDecode,
+    )
+    page = pdf.pages[1]
+    page.obj["/Resources"] = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=image))
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 595 0 0 842 0 0 cm /Im0 Do Q")
+    path = tmp_path / "scan.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert reads_like_text(probe_text(pages[1], workdir, "eng"))
+    # An odd language setting does not end up on the command line.
+    assert reads_like_text(probe_text(pages[1], workdir, "eng; rm -rf /"))
+
+
+def test_quick_look_that_cannot_run_gives_no_answer(tmp_path, workdir, monkeypatch):
+    from paperless_gemini_ocr import pages as pages_module
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("tesseract")
+
+    monkeypatch.setattr(pages_module.subprocess, "run", missing)
+    path = tmp_path / "scan.jpg"
+    Image.new("RGB", (60, 80), "white").save(path, "JPEG")
+    pages = prepare_image(path, "image/jpeg", workdir)
+    assert probe_text(pages[0], workdir, "eng") is None
+
+
+def test_quick_look_without_a_requested_language_gives_no_answer(tmp_path, workdir, monkeypatch):
+    """Tesseract exits with 0 after skipping a language it cannot load."""
+    from types import SimpleNamespace
+
+    from paperless_gemini_ocr import pages as pages_module
+
+    def partly_loaded(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"",
+            stderr=b"Failed loading language 'heb'\n",
+        )
+
+    monkeypatch.setattr(pages_module.subprocess, "run", partly_loaded)
+    path = tmp_path / "scan.jpg"
+    Image.new("RGB", (60, 80), "white").save(path, "JPEG")
+    pages = prepare_image(path, "image/jpeg", workdir)
+    assert probe_text(pages[0], workdir, "eng+heb") is None
+
+
+@needs_tesseract
+def test_quick_look_keeps_small_print_on_a_large_page(tmp_path, workdir):
+    """A3 at 300 dpi with print of about six points."""
+    import io
+
+    from PIL import ImageDraw
+    from PIL import ImageFont
+
+    image = Image.new("L", (3508, 4961), 255)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=25)
+    for index, line in enumerate(LINES):
+        draw.text((300, 400 + 60 * index), line, fill=0, font=font)
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG")
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(842, 1191))
+    stream = pikepdf.Stream(
+        pdf,
+        buffer.getvalue(),
+        Type=pikepdf.Name.XObject,
+        Subtype=pikepdf.Name.Image,
+        Width=3508,
+        Height=4961,
+        ColorSpace=pikepdf.Name.DeviceGray,
+        BitsPerComponent=8,
+        Filter=pikepdf.Name.DCTDecode,
+    )
+    page = pdf.pages[0]
+    page.obj["/Resources"] = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=stream))
+    page.obj["/Contents"] = pikepdf.Stream(pdf, b"q 842 0 0 1191 0 0 cm /Im0 Do Q")
+    path = tmp_path / "a3.pdf"
+    pdf.save(path)
+    pages = analyse_pdf(path, CFG, workdir)
+    assert reads_like_text(probe_text(pages[0], workdir, "eng"))

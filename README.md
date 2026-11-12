@@ -28,11 +28,14 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
 - Pages the model reports as upside down are turned upright in the archive
   PDF. The original file is never modified.
 - A page the model calls empty is not taken on its word. If the page has a
-  text layer of its own, or Tesseract finds text on it (three words or
-  more), the page counts as failed: it keeps that text and the document is
-  tagged. The same holds when Tesseract could not look at the page. A page
-  that really is empty costs one Tesseract run and is imported empty, without
-  a tag. With `PAPERLESS_OCR_MODE=off` there is nothing to check against.
+  text layer of its own, the page counts as failed and keeps that text.
+  Otherwise Tesseract takes a quick look at a small rendering of the page
+  (well under a second for an empty page): if it sees text, or could not
+  look, the page counts as failed too, gets proper local OCR text, and the
+  document is tagged. Scanner specks on a blank page are not taken for text.
+  The look uses the OCR languages of the installation, so it cannot vouch
+  for scripts Tesseract is not set up for. With `PAPERLESS_OCR_MODE=off`
+  there is nothing to check against.
 - A rate limit that says how long to wait (HTTP 429 with a retry delay) is
   waited out, up to two minutes and never past the document's time limit,
   instead of using up the attempts within seconds.

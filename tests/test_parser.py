@@ -18,6 +18,9 @@ from .conftest import ParseError
 def configured(monkeypatch, stub_parser):
     monkeypatch.setenv("PAPERLESS_GEMINI_OCR_API_KEY", "k")
     state.take_consume_flag(None)
+    # The quick Tesseract look at pages the model calls empty: sees nothing
+    # unless a test says otherwise, and never starts a real Tesseract here.
+    monkeypatch.setattr(plugin, "probe_text", lambda page, workdir, languages: "")
     return stub_parser
 
 
@@ -464,28 +467,44 @@ def test_rotation_setting_from_user_args_counts(configured, monkeypatch, pdf_fac
 
 LETTER = "Sehr geehrte Damen und Herren, anbei die Rechnung"
 DOUBT = "the model found no text on the page, local OCR did"
+UNCHECKED = "the model found no text on the page, local OCR could not check it"
+
+
+def probe_sees(monkeypatch, answers):
+    """Let the quick look return ``answers[page number]`` and record what it was asked."""
+    asked = []
+
+    def fake_probe(page, workdir, languages):
+        asked.append((page.number, page.payload.name if page.payload else None, languages))
+        return answers.get(page.number, "")
+
+    monkeypatch.setattr(plugin, "probe_text", fake_probe)
+    return asked
 
 
 def test_page_called_empty_is_checked_with_local_ocr(configured, monkeypatch, pdf_factory):
     """A page full of text that the model calls empty must not be imported empty."""
-    configured.force_text = LETTER
+    asked = probe_sees(monkeypatch, {2: LETTER})
     model_answers(
         monkeypatch,
         results={1: PageResult(text="eins", rotation=0), 2: PageResult(text="", rotation=0)},
     )
     parser = consume(pdf_factory(["scan", "scan"]))
+    assert [number for number, _, _ in asked] == [2]
+    # The quick look only decides; the text comes from a proper OCR pass.
     assert configured.calls == ["off", "force"]
-    assert parser.get_text() == f"eins\n\n{LETTER}"
+    assert parser.get_text() == "eins\n\nlocal text (force)"
     assert state.pop_report().failures == {2: DOUBT}
 
 
-def test_empty_page_stays_empty_when_local_ocr_finds_nothing(configured, monkeypatch, pdf_factory):
-    configured.force_text = " . | — "
+def test_empty_page_stays_empty_without_any_ocr_run(configured, monkeypatch, pdf_factory):
+    probe_sees(monkeypatch, {2: " . | — \n ,, 1"})
     model_answers(
         monkeypatch,
         results={1: PageResult(text="eins", rotation=0), 2: PageResult(text="", rotation=180)},
     )
     parser = consume(pdf_factory(["scan", "scan"]))
+    assert configured.calls == ["off"]
     assert parser.get_text() == "eins"
     assert state.pop_report() is None
     # The page is still the model's: its rotation counts.
@@ -493,42 +512,59 @@ def test_empty_page_stays_empty_when_local_ocr_finds_nothing(configured, monkeyp
         assert archive.pages[1].obj["/Rotate"] == 180
 
 
-def test_empty_page_check_reads_each_page_only_once(configured, monkeypatch, pdf_factory):
-    """Next to a failed page, the pages called empty are not sent through OCR twice."""
-    configured.force_text = LETTER
-    model_answers(
-        monkeypatch,
-        results={1: PageResult(text="", rotation=0)},
-        failures={2: "timeout"},
-    )
-    parser = consume(pdf_factory(["scan", "scan"]))
-    assert configured.calls == ["off", "force", "force"]
-    assert parser.get_text() == f"{LETTER}\n\n{LETTER}"
-    assert state.pop_report().failures == {1: DOUBT, 2: "timeout"}
+def test_specks_on_a_blank_page_are_not_text(configured, monkeypatch, pdf_factory):
+    """What OCR makes of scanner noise: stray marks with a few accidental words."""
+    from pathlib import Path
+
+    noise = (Path(__file__).parent / "noise_sample.txt").read_text(encoding="utf-8")
+    probe_sees(monkeypatch, {1: noise})
+    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    parser = consume(pdf_factory(["scan"]))
+    assert parser.get_text() == ""
+    assert state.pop_report() is None
+
+
+def test_page_that_could_not_be_checked_is_flagged(configured, monkeypatch, pdf_factory):
+    """No answer from the quick look says nothing about the page."""
+    probe_sees(monkeypatch, {1: None})
+    configured.force_text = ""
+    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    parser = consume(pdf_factory(["scan"]))
+    assert parser.get_text() == ""
+    assert state.pop_report().failures == {1: UNCHECKED}
 
 
 def test_empty_tiff_frame_is_checked_on_its_own(configured, monkeypatch, tmp_path):
-    configured.force_text = LETTER
+    asked = probe_sees(monkeypatch, {2: LETTER})
     model_answers(
         monkeypatch,
         results={1: PageResult(text="eins", rotation=0), 2: PageResult(text="", rotation=0)},
     )
     parser = consume(tiff_with_frames(tmp_path / "fax.tif", 2), "image/tiff")
+    assert [(number, name) for number, name, _ in asked] == [(2, "frame-00002.jpg")]
     assert [name for mode, name in configured.parsed if mode == "force"] == ["frame-00002.jpg"]
-    assert parser.get_text() == f"eins\n\n{LETTER}"
+    assert parser.get_text() == "eins\n\ntesseract text of frame-00002.jpg"
 
 
 def test_reprocess_does_not_replace_text_by_an_empty_page(configured, monkeypatch, pdf_factory):
-    configured.force_text = LETTER
+    probe_sees(monkeypatch, {1: LETTER})
     model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
     parser = plugin.GeminiOcrParser()
     with pytest.raises(ParseError, match="content left unchanged"):
         parser.parse(pdf_factory(["scan"]), "application/pdf", produce_archive=True)
+    assert configured.calls == ["off"]
     assert state.pop_report() is None
 
 
+def test_reprocess_stops_when_the_check_fails(configured, monkeypatch, pdf_factory):
+    probe_sees(monkeypatch, {1: None})
+    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    parser = plugin.GeminiOcrParser()
+    with pytest.raises(ParseError, match="content left unchanged"):
+        parser.parse(pdf_factory(["scan"]), "application/pdf", produce_archive=True)
+
+
 def test_reprocess_of_a_really_empty_page_works(configured, monkeypatch, pdf_factory):
-    configured.force_text = ""
     model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
     parser = plugin.GeminiOcrParser()
     parser.parse(pdf_factory(["scan"]), "application/pdf", produce_archive=True)
@@ -536,6 +572,7 @@ def test_reprocess_of_a_really_empty_page_works(configured, monkeypatch, pdf_fac
 
 
 def test_refused_reprocess_skips_the_empty_page_check(configured, monkeypatch, pdf_factory):
+    asked = probe_sees(monkeypatch, {1: LETTER})
     model_answers(
         monkeypatch,
         results={1: PageResult(text="", rotation=0)},
@@ -544,37 +581,29 @@ def test_refused_reprocess_skips_the_empty_page_check(configured, monkeypatch, p
     parser = plugin.GeminiOcrParser()
     with pytest.raises(ParseError, match=r"page\(s\) 2;"):
         parser.parse(pdf_factory(["scan", "scan"]), "application/pdf", produce_archive=True)
+    assert asked == []
     assert configured.calls == ["off"]
 
 
 def test_empty_page_is_believed_when_local_ocr_is_switched_off(configured, monkeypatch, pdf_factory):
     configured.configured_mode = "off"
-    configured.force_text = LETTER
+    asked = probe_sees(monkeypatch, {1: LETTER})
     model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
     parser = consume(pdf_factory(["scan"]))
+    assert asked == []
     assert configured.calls == ["off"]
     assert parser.get_text() == ""
     assert state.pop_report() is None
 
 
-UNCHECKED = "the model found no text on the page, local OCR could not check it"
-
-
-def test_failed_check_is_not_a_confirmation(configured, monkeypatch, pdf_factory):
-    """Local OCR crashing says nothing about the page; the document is flagged."""
-    configured.fail_modes = {"force"}
-    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
-    parser = consume(pdf_factory(["scan"]))
-    assert parser.get_text() == ""
-    assert state.pop_report().failures == {1: UNCHECKED}
-
-
-def test_reprocess_stops_when_the_check_fails(configured, monkeypatch, pdf_factory):
-    configured.fail_modes = {"force"}
+def test_quick_look_uses_the_ocr_languages_of_the_installation(configured, monkeypatch, pdf_factory):
+    asked = probe_sees(monkeypatch, {})
+    monkeypatch.setattr(plugin.GeminiOcrParser, "settings", None, raising=False)
     model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
     parser = plugin.GeminiOcrParser()
-    with pytest.raises(ParseError, match="content left unchanged"):
-        parser.parse(pdf_factory(["scan"]), "application/pdf", produce_archive=True)
+    parser.settings.language = "deu+eng"
+    parser.parse(pdf_factory(["scan"]), "application/pdf", produce_archive=True)
+    assert asked == [(1, "page-00001.pdf", "deu+eng")]
 
 
 def test_text_of_the_first_ocr_run_is_not_replaced_by_noise(configured, monkeypatch, pdf_factory):
@@ -585,10 +614,9 @@ def test_text_of_the_first_ocr_run_is_not_replaced_by_noise(configured, monkeypa
         "_first_pass_texts",
         lambda self, pages, failed: {1: LETTER},
     )
-    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    model_answers(monkeypatch, failures={1: "timeout"})
     parser = consume(pdf_factory(["scan"]))
     assert parser.get_text() == LETTER
-    assert state.pop_report().failures == {1: DOUBT}
 
 
 def test_without_page_boundaries_every_page_is_read_alone(configured, monkeypatch, pdf_factory):
@@ -612,28 +640,50 @@ def test_without_page_boundaries_every_page_is_read_alone(configured, monkeypatc
     assert parser.get_text() == "local text (force)\n\nzwei\n\nlocal text (force)"
 
 
-def test_too_many_pages_without_boundaries_count_as_unchecked(configured, monkeypatch, pdf_factory):
-    """Text that cannot be assigned to a page proves nothing for the later ones."""
-    configured.force_text = LETTER
+def test_too_many_pages_without_boundaries_keep_their_text_once(configured, monkeypatch, pdf_factory):
     monkeypatch.setattr(plugin, "pdf_page_texts", lambda path: None)
     monkeypatch.setattr(plugin, "_SINGLE_PAGE_PASSES", 1)
-    model_answers(
-        monkeypatch,
-        results={1: PageResult(text="", rotation=0), 2: PageResult(text="", rotation=0)},
-    )
+    model_answers(monkeypatch, failures={1: "timeout", 2: "timeout"})
     parser = consume(pdf_factory(["scan", "scan"]))
-    assert parser.get_text() == LETTER
-    assert state.pop_report().failures == {1: DOUBT, 2: UNCHECKED}
+    assert configured.calls == ["off", "force"]
+    assert parser.get_text() == "local text (force)"
 
 
-def test_pages_beyond_the_ocr_page_limit_count_as_unchecked(configured, monkeypatch, pdf_factory):
-    """PAPERLESS_OCR_PAGES=1: the second page was never read, so it is not confirmed empty."""
+def test_fallback_ocr_stops_at_the_page_limit_of_the_installation(configured, monkeypatch, pdf_factory):
+    """PAPERLESS_OCR_PAGES=1: OCR reads one page, so only one is handed over."""
     configured.configured_pages = 1
-    configured.force_text = ""
-    model_answers(
-        monkeypatch,
-        results={1: PageResult(text="", rotation=0), 2: PageResult(text="", rotation=0)},
-    )
+    model_answers(monkeypatch, failures={1: "timeout", 2: "timeout"})
     parser = consume(pdf_factory(["scan", "scan"]))
-    assert parser.get_text() == ""
-    assert state.pop_report().failures == {2: UNCHECKED}
+    assert configured.forced_widths == [[595]]
+    assert parser.get_text() == "local text (force)"
+
+
+def test_short_text_layer_is_not_given_up_for_an_empty_answer(configured, monkeypatch, pdf_factory):
+    """Below the size at which the layer alone decides, but plainly a sentence."""
+    asked = probe_sees(monkeypatch, {})
+    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    configured.fail_modes = {"force"}
+    parser = consume(pdf_factory(["scan_text"], text="Bitte senden Sie uns die Rechnung."))
+    assert asked == []
+    assert parser.get_text() == "Bitte senden Sie uns die Rechnung."
+    assert state.pop_report().failures == {1: "the model found no text on a page that has some"}
+
+
+def test_text_of_the_first_ocr_run_counts_against_an_empty_answer(
+    configured,
+    monkeypatch,
+    pdf_factory,
+):
+    monkeypatch.setenv("PAPERLESS_GEMINI_OCR_LOCAL_OCR", "always")
+    asked = probe_sees(monkeypatch, {})
+    configured.force_text = ""
+    monkeypatch.setattr(
+        plugin.GeminiOcrParser,
+        "_first_pass_texts",
+        lambda self, pages, failed: {1: LETTER},
+    )
+    model_answers(monkeypatch, results={1: PageResult(text="", rotation=0)})
+    parser = consume(pdf_factory(["scan"]))
+    assert asked == []
+    assert parser.get_text() == LETTER
+    assert state.pop_report() is not None
