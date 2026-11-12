@@ -5,3 +5,5 @@ dist/
 .pytest_cache/
 .env
 *.pyc
+integration/plugins/*.whl
+integration/results/
