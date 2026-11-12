@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paperless-gemini-ocr"
+version = "0.1.0"
+description = "Parser plugin for Paperless-ngx 3.x that reads scanned pages with Google Gemini during consumption"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "pipamann" }]
+keywords = ["paperless-ngx", "ocr", "gemini", "plugin"]
+# All three ship with Paperless-ngx, so installing the plugin into the
+# Paperless environment downloads nothing.
+dependencies = ["httpx", "pikepdf", "Pillow"]
+
+[project.urls]
+Homepage = "https://github.com/pipamann/paperless-gemini-ocr"
+Issues = "https://github.com/pipamann/paperless-gemini-ocr/issues"
+
+[project.entry-points."paperless_ngx.parsers"]
+gemini_ocr = "paperless_gemini_ocr.parser:GeminiOcrParser"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paperless_gemini_ocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
