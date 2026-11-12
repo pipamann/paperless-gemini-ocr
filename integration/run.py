@@ -325,14 +325,14 @@ def functional() -> None:
     time.sleep(45)
     check("reprocess with model down: content unchanged", document(jpg_doc_id)["content"] == before, document(jpg_doc_id)["content"][:80])
     check("reprocess with model down: model was tried", stats()["requests"] == 3, stats())
-    control(mode="ok")
+    control(mode="ok", label="second-reading")
     reprocess(jpg_doc_id)
     deadline = time.monotonic() + 120
     after = before
     while time.monotonic() < deadline and after == before:
         time.sleep(2)
         after = document(jpg_doc_id)["content"]
-    check("reprocess with model up: content replaced", after != before and after.startswith("FAKE-OCR request"), after[:80])
+    check("reprocess with model up: content replaced", "second-reading" in after, after[:80])
 
     # --- new version of an existing document goes through the plugin too
     control(mode="ok")

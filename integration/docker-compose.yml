@@ -26,7 +26,10 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./plugins:/custom-cont-init.d:ro
+      # Paperless runs every file in /custom-cont-init.d, so only the script
+      # goes there and the wheel sits next to it in its own folder.
+      - ./plugins/install.sh:/custom-cont-init.d/install-gemini-ocr.sh:ro
+      - ./plugins:/opt/gemini-ocr:ro
       - ./:/it:ro
       - ./results:/results
       - consume:/usr/src/paperless/consume

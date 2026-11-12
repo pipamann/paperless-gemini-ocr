@@ -1,6 +1,6 @@
 """Stand-in for the Gemini API, steerable over HTTP.
 
-GET /control?mode=ok|fail|flaky|empty&delay=SECONDS&rotation=DEGREES&fail_first=N
+GET /control?mode=ok|fail|flaky|empty&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
     sets the behaviour and resets the counters.
 GET /stats returns what was requested since.
 """
@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 LOCK = threading.Lock()
-STATE = {"mode": "ok", "delay": 0.0, "rotation": 0, "fail_first": 0}
+STATE = {"mode": "ok", "delay": 0.0, "rotation": 0, "fail_first": 0, "label": ""}
 STATS = {"requests": 0, "mimes": [], "max_parallel": 0, "active": 0, "key_seen": False}
 
 
@@ -44,6 +44,7 @@ class Handler(BaseHTTPRequestHandler):
                     delay=float(query.get("delay", ["0"])[0]),
                     rotation=int(query.get("rotation", ["0"])[0]),
                     fail_first=int(query.get("fail_first", ["0"])[0]),
+                    label=query.get("label", [""])[0],
                 )
                 STATS.update(requests=0, mimes=[], max_parallel=0, key_seen=False)
                 self._json(200, dict(STATE))
@@ -77,7 +78,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 text = (
                     f"ROTATION: {state['rotation']}\n"
-                    f"FAKE-OCR request {number} ({part['mime_type']})"
+                    f"FAKE-OCR request {number} ({part['mime_type']}) {state['label']}"
                 )
                 self._json(
                     200,
