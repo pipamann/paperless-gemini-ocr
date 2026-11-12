@@ -36,6 +36,8 @@ services:
       PAPERLESS_DBPASS: paperless
       PAPERLESS_ADMIN_USER: admin
       PAPERLESS_ADMIN_PASSWORD: integration-test
+      # Fixed on purpose: this stack holds generated test pages only.
+      PAPERLESS_SECRET_KEY: integration-stack-only-not-for-any-real-installation
       PAPERLESS_OCR_LANGUAGE: deu+eng
       PAPERLESS_TASK_WORKERS: 4
       PAPERLESS_CONSUMER_RECURSIVE: "true"
