@@ -494,10 +494,13 @@ class GeminiOcrParser(RasterisedDocumentParser):
         accepted: tuple[int, ...],
     ) -> None:
         """Turn pages upright in the archive PDF. The original is never touched."""
+        # A rotation that a second reading confirmed is safe whatever its
+        # angle; an unconfirmed one only where the setting accepts it.
         turns = {
             number: result.rotation
             for number, result in outcome.results.items()
             if result.rotation in accepted
+            or (result.rotation_confirmed and result.rotation in (90, 180, 270))
         }
         if not turns:
             return

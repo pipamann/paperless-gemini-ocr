@@ -687,3 +687,22 @@ def test_text_of_the_first_ocr_run_counts_against_an_empty_answer(
     assert asked == []
     assert parser.get_text() == LETTER
     assert state.pop_report() is not None
+
+
+def test_confirmed_sideways_rotation_is_applied_in_the_default_setting(
+    configured,
+    monkeypatch,
+    pdf_factory,
+):
+    """Unconfirmed, 90 and 270 are left alone; a second reading settles which it is."""
+    model_answers(
+        monkeypatch,
+        results={
+            1: PageResult(text="quer, bestätigt", rotation=90, rotation_confirmed=True),
+            2: PageResult(text="quer, unbestätigt", rotation=270),
+        },
+    )
+    parser = consume(pdf_factory(["scan", "scan"]))
+    with pikepdf.open(parser.archive_path) as archive:
+        assert archive.pages[0].obj["/Rotate"] == 90
+        assert "/Rotate" not in archive.pages[1].obj

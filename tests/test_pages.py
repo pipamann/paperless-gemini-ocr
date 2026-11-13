@@ -15,6 +15,7 @@ from paperless_gemini_ocr.pages import normalise_text
 from paperless_gemini_ocr.pages import prepare_image
 from paperless_gemini_ocr.pages import probe_text
 from paperless_gemini_ocr.pages import reads_like_text
+from paperless_gemini_ocr.pages import turn_payload
 
 CFG = Config(api_key="k")
 
@@ -976,3 +977,48 @@ def test_quick_look_keeps_small_print_on_a_large_page(tmp_path, workdir):
     pdf.save(path)
     pages = analyse_pdf(path, CFG, workdir)
     assert reads_like_text(probe_text(pages[0], workdir, "eng"))
+
+
+def test_pdf_page_is_turned_by_its_rotate_entry(pdf_factory, workdir):
+    import io
+
+    pages = analyse_pdf(pdf_factory(["scan"]), CFG, workdir)
+    data, mime = load_payload(pages[0], CFG, workdir)
+    once, mime_once = turn_payload(data, mime, 90)
+    twice, _ = turn_payload(once, mime_once, 270)
+    assert mime_once == "application/pdf"
+    with pikepdf.open(io.BytesIO(once)) as pdf:
+        assert pdf.pages[0].obj["/Rotate"] == 90
+    with pikepdf.open(io.BytesIO(twice)) as pdf:
+        assert pdf.pages[0].obj["/Rotate"] == 0
+
+
+@pytest.mark.parametrize(
+    ("degrees", "size", "corner"),
+    [
+        # The dark corner starts top left; clockwise turns move it right, then down.
+        (90, (80, 60), (79, 0)),
+        (180, (60, 80), (59, 79)),
+        (270, (80, 60), (0, 59)),
+    ],
+)
+def test_image_is_turned_clockwise(degrees, size, corner):
+    import io
+
+    image = Image.new("RGB", (60, 80), "white")
+    for x in range(12):
+        for y in range(12):
+            image.putpixel((x, y), (0, 0, 0))
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    data, mime = turn_payload(buffer.getvalue(), "image/png", degrees)
+    assert mime == "image/jpeg"
+    with Image.open(io.BytesIO(data)) as turned:
+        assert turned.size == size
+        assert sum(turned.convert("L").getpixel(corner) for _ in range(1)) < 60
+        assert turned.convert("L").getpixel((size[0] // 2, size[1] // 2)) > 200
+
+
+def test_turning_by_another_angle_is_refused():
+    with pytest.raises(ValueError):
+        turn_payload(b"", "application/pdf", 45)

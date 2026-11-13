@@ -83,6 +83,7 @@ class GeminiError(Exception):
         attempts: int = 1,
         retry_after: float | None = None,
         recitation: bool = False,
+        blocked: bool = False,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
@@ -91,12 +92,16 @@ class GeminiError(Exception):
         self.retry_after = retry_after
         # The answer was cut off for repeating known text.
         self.recitation = recitation
+        # The API refused the request itself (promptFeedback.blockReason).
+        self.blocked = blocked
 
 
 @dataclass
 class PageResult:
     text: str
     rotation: int | None
+    # The rotation was confirmed: turned by it, the page was read as upright.
+    rotation_confirmed: bool = False
     attempts: int = 1
     seconds: float = 0.0
     input_tokens: int = 0
@@ -197,6 +202,7 @@ def _parse_response(payload: dict, numbered: bool = False) -> PageResult:
         raise GeminiError(
             f"request blocked ({_code(feedback['blockReason'])})",
             retryable=False,
+            blocked=True,
         )
     candidates = payload.get("candidates") or []
     if not candidates:

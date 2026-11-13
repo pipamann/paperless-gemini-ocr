@@ -852,6 +852,45 @@ def prepare_image(path: Path, mime_type: str, workdir: Path) -> list[Page]:
 # ---------------------------------------------------------------------------
 
 
+def turn_payload(data: bytes, mime_type: str, degrees: int) -> tuple[bytes, str]:
+    """The same page turned clockwise by ``degrees`` (90, 180 or 270), ready to send.
+
+    A PDF page gets its /Rotate entry changed, nothing is rendered. An image
+    is turned and saved as JPEG.
+    """
+    import io
+
+    if degrees not in (90, 180, 270):
+        raise ValueError("degrees must be 90, 180 or 270")
+    if mime_type == "application/pdf":
+        import pikepdf
+
+        with pikepdf.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                current = int(_inherited(page.obj, "/Rotate") or 0)
+                page.obj["/Rotate"] = (current + degrees) % 360
+            out = io.BytesIO()
+            pdf.save(out)
+        return out.getvalue(), mime_type
+
+    from PIL import Image
+
+    # ROTATE_270 turns by 270 degrees counter-clockwise, which is 90 clockwise.
+    method = {
+        90: Image.Transpose.ROTATE_270,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_90,
+    }[degrees]
+    with Image.open(io.BytesIO(data)) as image:
+        turned = _upright_rgb(image).transpose(method)
+    for quality in (90, 80, 65, 50):
+        out = io.BytesIO()
+        turned.save(out, "JPEG", quality=quality)
+        if out.tell() <= MAX_INLINE_BYTES:
+            return out.getvalue(), "image/jpeg"
+    raise AnalysisError("page too large to upload")
+
+
 def _discard(path: Path) -> None:
     try:
         path.unlink()
@@ -873,10 +912,13 @@ def load_payload(
     model works. Image files stay: local OCR may need them for a failed page.
     """
     is_pdf_page = page.source_pdf is not None
+    # The copy of a PDF page is gone once it has been read; a second call
+    # (the page sent as a picture after all) renders it.
     use_file = (
         page.payload is not None
-        and page.payload.stat().st_size <= MAX_INLINE_BYTES
         and not (is_pdf_page and cfg.page_input == "image")
+        and page.payload.is_file()
+        and page.payload.stat().st_size <= MAX_INLINE_BYTES
     )
     if use_file:
         data = page.payload.read_bytes()

@@ -1,12 +1,15 @@
 """Stand-in for the Gemini API, steerable over HTTP.
 
-GET /control?mode=ok|fail|flaky|empty|blank|garbage|ratelimit|recitation&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
+GET /control?mode=ok|fail|flaky|empty|blank|garbage|ratelimit|recitation|picky&delay=SECONDS&rotation=DEGREES&rotation_requests=N&fail_first=N&label=TEXT
+    rotation_requests=N: only the first N requests report the rotation, later ones report 0
+    (a page that is read as upright once it has been turned).
     sets the behaviour and resets the counters.
 GET /stats returns what was requested since.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -16,8 +19,8 @@ from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
 LOCK = threading.Lock()
-STATE = {"mode": "ok", "delay": 0.0, "rotation": 0, "fail_first": 0, "label": ""}
-STATS = {"requests": 0, "mimes": [], "times": [], "max_parallel": 0, "active": 0, "key_seen": False}
+STATE = {"mode": "ok", "delay": 0.0, "rotation": 0, "rotation_requests": 0, "fail_first": 0, "label": ""}
+STATS = {"requests": 0, "mimes": [], "hashes": [], "times": [], "max_parallel": 0, "active": 0, "key_seen": False}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -43,10 +46,11 @@ class Handler(BaseHTTPRequestHandler):
                     mode=query.get("mode", ["ok"])[0],
                     delay=float(query.get("delay", ["0"])[0]),
                     rotation=int(query.get("rotation", ["0"])[0]),
+                    rotation_requests=int(query.get("rotation_requests", ["0"])[0]),
                     fail_first=int(query.get("fail_first", ["0"])[0]),
                     label=query.get("label", [""])[0],
                 )
-                STATS.update(requests=0, mimes=[], times=[], max_parallel=0, key_seen=False)
+                STATS.update(requests=0, mimes=[], hashes=[], times=[], max_parallel=0, key_seen=False)
                 self._json(200, dict(STATE))
             return
         if url.path == "/stats":
@@ -63,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
             STATS["requests"] += 1
             number = STATS["requests"]
             STATS["mimes"].append(part["mime_type"])
+            # Lets a test see whether two requests carried the same page data.
+            STATS["hashes"].append(hashlib.sha256(part["data"].encode()).hexdigest()[:16])
             STATS["times"].append(time.monotonic())
             STATS["active"] += 1
             STATS["max_parallel"] = max(STATS["max_parallel"], STATS["active"])
@@ -91,6 +97,10 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     },
                 )
+            elif state["mode"] == "picky" and part["mime_type"] == "application/pdf":
+                # The request itself is refused, as the API does with one
+                # rendering of a page while it takes another.
+                self._json(200, {"promptFeedback": {"blockReason": "OTHER"}})
             elif state["mode"] == "recitation":
                 # Refused as the API refuses known text, unless numbered lines are asked for.
                 asked = body["contents"][0]["parts"][1]["text"]
@@ -118,8 +128,11 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
             else:
+                rotation = state["rotation"]
+                if 0 < state["rotation_requests"] < number:
+                    rotation = 0
                 text = (
-                    f"ROTATION: {state['rotation']}\n"
+                    f"ROTATION: {rotation}\n"
                     f"FAKE-OCR request {number} ({part['mime_type']}) {state['label']}"
                 )
                 self._json(

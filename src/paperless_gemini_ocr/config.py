@@ -121,10 +121,16 @@ class Config:
     # the archive PDF keeps its text layer.
     local_ocr: str = "fallback"
     # Turn pages upright in the archive PDF when the model reports a rotation.
-    # "upside-down": only pages reported as rotated by 180 degrees. The model
-    # is reliable there, while it sometimes confuses 90 and 270.
+    # "upside-down": pages reported as rotated by 180 degrees, and any other
+    # rotation that a second reading has confirmed (see reread_rotated). The
+    # model is reliable for 180, while it sometimes confuses 90 and 270.
     # "all": every reported rotation. "off": never.
     rotate: str = "upside-down"
+    # Read a page again, turned upright, when the model reports it as rotated.
+    # Upside-down text is read worse (Hebrew: 59 instead of 97 percent
+    # agreement with the upright reading), and the second reading settles
+    # which way a sideways page was turned.
+    reread_rotated: bool = True
 
     # Tag (and note) for documents where the model failed and local OCR text
     # was used instead. Empty string disables the tag.
@@ -185,6 +191,7 @@ class Config:
                 defaults.rotate,
                 ("upside-down", "all", "off"),
             ),
+            reread_rotated=_get_bool("REREAD_ROTATED", defaults.reread_rotated),
             failure_tag=os.environ.get(PREFIX + "FAILURE_TAG", defaults.failure_tag).strip(),
             failure_note=_get_bool("FAILURE_NOTE", defaults.failure_note),
             prompt_file=_get("PROMPT_FILE"),

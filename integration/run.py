@@ -414,6 +414,24 @@ def functional() -> None:
     check("rate limit: waited as long as asked", len(seen["times"]) == 2 and seen["times"][1] - seen["times"][0] >= 6, seen["times"])
     check("rate limit: not flagged", review_tag_id() not in doc["tags"], doc["tags"])
 
+    # --- a page reported as lying on its side is read again, turned upright
+    control(mode="ok", rotation=90, rotation_requests=1)
+    doc = document(consume("sideways", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    check("sideways: second reading is the one kept", doc["content"].startswith("FAKE-OCR request 2"), doc["content"][:80])
+    check("sideways: confirmed rotation turned in the archive", archive_rotation(doc["id"]) == [90], archive_rotation(doc["id"]))
+    seen = stats()
+    check("sideways: two requests", seen["requests"] == 2, seen)
+    # Which way it was turned is covered by the unit tests; here: that the second request is another picture.
+    check("sideways: second request carries the turned page", len(set(seen["hashes"])) == 2, seen["hashes"])
+
+    # --- a PDF page the API refuses is sent again as a picture
+    control(mode="picky")
+    doc = document(consume("picky", "pdf", scan_pdf([page_image(letter(uid()))]))["id"])
+    seen = stats()
+    check("refused pdf page: read as a picture", "(image/jpeg)" in doc["content"], doc["content"][:80])
+    check("refused pdf page: one request each way", seen["mimes"] == ["application/pdf", "image/jpeg"], seen["mimes"])
+    check("refused pdf page: not flagged", review_tag_id() not in doc["tags"], doc["tags"])
+
     # --- an answer cut off as RECITATION is asked for again with numbered lines
     control(mode="recitation")
     doc = document(consume("recitation", "jpg", jpeg(page_image(letter(uid()))))["id"])
