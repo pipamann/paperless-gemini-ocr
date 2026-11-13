@@ -141,9 +141,12 @@ an image with more than 120 megapixels or a TIFF with more than 2000 frames
 is imported with local OCR only and tagged, and a PDF page whose content
 needs unusual effort to analyse is rendered instead of being taken apart.
 
-The Gemini API refuses a page now and then, for example a handwritten page
-with ID numbers (`blockReason: OTHER`). That is final for the page: Tesseract
-reads it and the document is tagged.
+The Gemini API refuses a page now and then. An answer cut off as
+`RECITATION` (pages with standard texts such as insurance terms, court forms
+or statutes; about one page in sixty here) is asked for again with numbered
+lines, which gets such pages read; the numbers are taken off again. A request
+blocked outright (`blockReason`, seen on a handwritten page with ID numbers)
+is final for the page: Tesseract reads it and the document is tagged.
 
 ## Speed and cost
 

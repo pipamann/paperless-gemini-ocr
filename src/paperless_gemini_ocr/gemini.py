@@ -41,6 +41,17 @@ PROTOCOL = (
     "page contains no text at all, output only the ROTATION line."
 )
 
+# Added to the request after the API has cut an answer off as RECITATION. It
+# does that when the output repeats text it knows word for word (insurance
+# terms, court forms, statutes), and it does so every time for the same page.
+# With numbered lines the output is no longer that text, and the page is read.
+NUMBERED_LINES = (
+    "\n\nFor this page, start every line of the transcription with its running "
+    "number and a vertical bar, like `1| first line`, `2| second line`. The "
+    "ROTATION line stays as it is, without a number."
+)
+_LINE_NUMBER = re.compile(r"^\s*(\d{1,5})\s?\|\s?")
+
 _ROTATION_LINE = re.compile(r"^\s*`?\s*ROTATION:\s*(\d{1,3})\s*°?\s*`?\s*$", re.IGNORECASE)
 _FENCE = re.compile(r"^```[\w-]*\n(.*)\n```$", re.DOTALL)
 _RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
@@ -71,12 +82,15 @@ class GeminiError(Exception):
         retryable: bool,
         attempts: int = 1,
         retry_after: float | None = None,
+        recitation: bool = False,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.attempts = attempts
         # Seconds the endpoint asked to wait before the next request.
         self.retry_after = retry_after
+        # The answer was cut off for repeating known text.
+        self.recitation = recitation
 
 
 @dataclass
@@ -90,7 +104,14 @@ class PageResult:
     thinking_tokens: int = 0
 
 
-def build_request(cfg: Config, data: bytes, mime_type: str, prompt: str) -> dict:
+def build_request(
+    cfg: Config,
+    data: bytes,
+    mime_type: str,
+    prompt: str,
+    *,
+    numbered: bool = False,
+) -> dict:
     generation: dict = {"maxOutputTokens": cfg.max_output_tokens}
     if cfg.thinking in _THINKING_LEVELS:
         generation["thinkingConfig"] = {"thinkingLevel": cfg.thinking}
@@ -109,7 +130,7 @@ def build_request(cfg: Config, data: bytes, mime_type: str, prompt: str) -> dict
                             "data": base64.b64encode(data).decode("ascii"),
                         },
                     },
-                    {"text": prompt + PROTOCOL},
+                    {"text": prompt + PROTOCOL + (NUMBERED_LINES if numbered else "")},
                 ],
             },
         ],
@@ -135,15 +156,42 @@ def split_rotation(text: str) -> tuple[int | None, str]:
     return (degrees if degrees in (0, 90, 180, 270) else None), rest
 
 
-def parse_response(payload: object) -> PageResult:
+def remove_line_numbers(raw: str) -> str:
+    """Undo the numbering asked for with ``NUMBERED_LINES``, on the raw answer.
+
+    Numbers are only taken off when they are plainly the ones asked for:
+    every line carries one and they run 1, 2, 3 without a gap (the ROTATION
+    line may be numbered along or not). An answer without a line numbered 1
+    ignored the request and is left as it is, so table rows like
+    ``12| 100 EUR`` keep their start. Anything in between, numbering begun
+    and not kept, cannot be told apart from content and counts as a failed
+    answer.
+    """
+    lines = raw.split("\n")
+    filled = [i for i, line in enumerate(lines) if line.strip() and not line.strip().startswith("```")]
+    if filled and _ROTATION_LINE.match(lines[filled[0]]):
+        filled = filled[1:]
+    found = [_LINE_NUMBER.match(lines[i]) for i in filled]
+    numbers = [int(m.group(1)) if m else None for m in found]
+    if 1 not in numbers:
+        return raw
+    if numbers != list(range(1, len(numbers) + 1)):
+        raise GeminiError("answer did not keep to the numbered lines", retryable=True)
+    for i, match in zip(filled, found, strict=True):
+        lines[i] = lines[i][match.end() :]
+    return "\n".join(lines)
+
+
+def parse_response(payload: object, *, numbered: bool = False) -> PageResult:
+    """Text and rotation of an answer; ``numbered`` when numbered lines were asked for."""
     try:
-        return _parse_response(payload)
+        return _parse_response(payload, numbered)
     except (AttributeError, TypeError, KeyError, IndexError, ValueError) as e:
         # Valid JSON of another shape, e.g. from a gateway in front of the API.
         raise GeminiError("answer has an unexpected structure", retryable=True) from e
 
 
-def _parse_response(payload: dict) -> PageResult:
+def _parse_response(payload: dict, numbered: bool = False) -> PageResult:
     feedback = payload.get("promptFeedback") or {}
     if feedback.get("blockReason"):
         raise GeminiError(
@@ -158,12 +206,19 @@ def _parse_response(payload: dict) -> PageResult:
     if finish not in (None, "STOP"):
         # MAX_TOKENS on a single page means the model looped or thought the
         # budget away; SAFETY and RECITATION are not deterministic either.
-        raise GeminiError(f"answer ended with {_code(finish)}", retryable=True)
+        raise GeminiError(
+            f"answer ended with {_code(finish)}",
+            retryable=True,
+            recitation=finish == "RECITATION",
+        )
     parts = (candidate.get("content") or {}).get("parts") or []
     raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not raw.strip():
         raise GeminiError("empty answer", retryable=True)
-    rotation, text = split_rotation(raw.replace("\x00", ""))
+    raw = raw.replace("\x00", "")
+    if numbered:
+        raw = remove_line_numbers(raw)
+    rotation, text = split_rotation(raw)
     if not text and rotation is None:
         # An empty page is only believed when the answer follows the protocol.
         raise GeminiError("answer without text and without a valid rotation line", retryable=True)
@@ -315,6 +370,7 @@ class GeminiClient:
         url = f"{cfg.base_url}/models/{cfg.model}:generateContent"
         headers = {"x-goog-api-key": cfg.api_key or "", "accept-encoding": "identity"}
         body = build_request(cfg, data, mime_type, prompt)
+        numbered = False
         started = self._clock()
         error = GeminiError("not attempted", retryable=False)
 
@@ -333,7 +389,7 @@ class GeminiClient:
                 status_code, raw, retry_header = self._post(url, headers, body, timeout)
                 if status_code != 200:
                     raise _http_error(status_code, raw, retry_header)
-                result = parse_response(json.loads(raw))
+                result = parse_response(json.loads(raw), numbered=numbered)
                 result.attempts = attempt
                 result.seconds = self._clock() - started
                 return result
@@ -352,6 +408,12 @@ class GeminiClient:
             error.attempts = attempt
             if not error.retryable or attempt == cfg.max_attempts:
                 break
+            if error.recitation and not numbered:
+                # Asking the same again gets the same refusal; ask for
+                # numbered lines instead, at once.
+                numbered = True
+                body = build_request(cfg, data, mime_type, prompt, numbered=True)
+                continue
             delay = min(2.0**attempt + random.uniform(0, 1), 20.0)
             left = None if deadline is None else max(0.0, deadline - self._clock() - 1)
             if error.retry_after is not None:

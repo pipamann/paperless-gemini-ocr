@@ -414,6 +414,13 @@ def functional() -> None:
     check("rate limit: waited as long as asked", len(seen["times"]) == 2 and seen["times"][1] - seen["times"][0] >= 6, seen["times"])
     check("rate limit: not flagged", review_tag_id() not in doc["tags"], doc["tags"])
 
+    # --- an answer cut off as RECITATION is asked for again with numbered lines
+    control(mode="recitation")
+    doc = document(consume("recitation", "jpg", jpeg(page_image(letter(uid()))))["id"])
+    check("recitation: read on the second attempt", doc["content"].startswith("FAKE-OCR request 2"), doc["content"][:80])
+    check("recitation: line numbers taken off again", "second line | with a bar" in doc["content"] and "1|" not in doc["content"] and "2|" not in doc["content"], doc["content"][:120])
+    check("recitation: two requests, not flagged", stats()["requests"] == 2 and review_tag_id() not in doc["tags"], stats())
+
     # --- error answers of another shape are retried like any other failure
     control(mode="garbage")
     doc = document(consume("garbage", "jpg", jpeg(page_image(letter(uid()))))["id"])

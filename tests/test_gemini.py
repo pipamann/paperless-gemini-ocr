@@ -11,6 +11,8 @@ from paperless_gemini_ocr.gemini import GeminiClient
 from paperless_gemini_ocr.gemini import GeminiError
 from paperless_gemini_ocr.gemini import build_request
 from paperless_gemini_ocr.gemini import split_rotation
+from paperless_gemini_ocr.gemini import parse_response
+from paperless_gemini_ocr.gemini import remove_line_numbers
 
 CFG = Config(api_key="secret-key", base_url="https://gemini.test/v1beta", max_attempts=3)
 
@@ -418,3 +420,100 @@ def test_unreadable_retry_after_is_ignored():
     )
     assert client.transcribe(b"data", "image/jpeg", "prompt").text == "ok"
     assert sleeps[0] <= 3
+
+
+def text_of(request: httpx.Request) -> str:
+    return json.loads(request.content)["contents"][0]["parts"][1]["text"]
+
+
+def test_refused_as_recitation_is_asked_again_with_numbered_lines():
+    """The same request gets the same refusal; numbered lines get the page read."""
+    client, requests, sleeps = client_for(
+        [
+            (200, answer("", finish="RECITATION")),
+            (200, answer("ROTATION: 0\n1| Allgemeine Bedingungen\n2| § 1 Umfang | Geltung\n3| 12| Beispiel")),
+        ],
+    )
+    result = client.transcribe(b"data", "image/jpeg", "prompt")
+    assert result.text == "Allgemeine Bedingungen\n§ 1 Umfang | Geltung\n12| Beispiel"
+    assert result.rotation == 0
+    assert result.attempts == 2
+    assert "running number" not in text_of(requests[0])
+    assert "running number" in text_of(requests[1])
+    assert text_of(requests[1]).startswith("prompt" + PROTOCOL)
+    # No waiting in between: nothing is overloaded.
+    assert sleeps == []
+
+
+def test_recitation_with_numbered_lines_too_is_a_failure():
+    refused = (200, answer("", finish="RECITATION"))
+    client, requests, _ = client_for([refused, refused, refused])
+    with pytest.raises(GeminiError, match="RECITATION") as caught:
+        client.transcribe(b"data", "image/jpeg", "prompt")
+    assert caught.value.attempts == 3
+    assert ["running number" in text_of(r) for r in requests] == [False, True, True]
+
+
+def test_other_failures_do_not_switch_to_numbered_lines():
+    client, requests, _ = client_for(
+        [(200, answer("", finish="MAX_TOKENS")), (200, answer("ROTATION: 0\nText"))],
+    )
+    assert client.transcribe(b"data", "image/jpeg", "prompt").text == "Text"
+    assert "running number" not in text_of(requests[1])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # As asked: every line numbered, empty lines without a number.
+        ("ROTATION: 0\n1| eins\n2| zwei | drei\n\n3|vier\n 4 | 12| fünf", "ROTATION: 0\neins\nzwei | drei\n\nvier\n12| fünf"),
+        # The ROTATION line numbered along.
+        ("1| ROTATION: 180\n2| Kopf\n3| Inhalt", "ROTATION: 180\nKopf\nInhalt"),
+        # The request was ignored; rows of a table keep their start.
+        ("ROTATION: 0\nPosition | Betrag\n12| 100 EUR\n34| 200 EUR", "ROTATION: 0\nPosition | Betrag\n12| 100 EUR\n34| 200 EUR"),
+        ("ROTATION: 0", "ROTATION: 0"),
+        ("", ""),
+    ],
+)
+def test_remove_line_numbers(raw, expected):
+    assert remove_line_numbers(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Numbering begun and not kept: not to be told apart from content.
+        "ROTATION: 0\n1| Kopf\ngewöhnliche Zeile\nnoch eine",
+        "ROTATION: 0\nKopf\n1| eins\n2| zwei",
+        "ROTATION: 0\n1| eins\n3| drei",
+        "ROTATION: 0\n1| eins\n2| zwei\n2| noch einmal zwei",
+    ],
+)
+def test_half_kept_numbering_is_a_failed_answer(raw):
+    with pytest.raises(GeminiError, match="numbered lines") as caught:
+        remove_line_numbers(raw)
+    assert caught.value.retryable
+
+
+def test_numbered_rotation_line_still_gives_the_rotation():
+    result = parse_response(answer("1| ROTATION: 180\n2| Kopf\n3| Inhalt"), numbered=True)
+    assert result.rotation == 180
+    assert result.text == "Kopf\nInhalt"
+
+
+def test_numbers_stay_when_no_numbering_was_asked_for():
+    result = parse_response(answer("ROTATION: 0\n1| eins\n2| zwei"))
+    assert result.text == "1| eins\n2| zwei"
+
+
+def test_half_kept_numbering_leads_to_another_attempt():
+    client, requests, _ = client_for(
+        [
+            (200, answer("", finish="RECITATION")),
+            (200, answer("ROTATION: 0\n1| Kopf\ngewöhnliche Zeile")),
+            (200, answer("ROTATION: 0\n1| Kopf\n2| gewöhnliche Zeile")),
+        ],
+    )
+    result = client.transcribe(b"data", "image/jpeg", "prompt")
+    assert result.text == "Kopf\ngewöhnliche Zeile"
+    assert result.attempts == 3

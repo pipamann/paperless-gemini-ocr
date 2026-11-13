@@ -1,6 +1,6 @@
 """Stand-in for the Gemini API, steerable over HTTP.
 
-GET /control?mode=ok|fail|flaky|empty|blank|garbage|ratelimit&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
+GET /control?mode=ok|fail|flaky|empty|blank|garbage|ratelimit|recitation&delay=SECONDS&rotation=DEGREES&fail_first=N&label=TEXT
     sets the behaviour and resets the counters.
 GET /stats returns what was requested since.
 """
@@ -91,6 +91,17 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     },
                 )
+            elif state["mode"] == "recitation":
+                # Refused as the API refuses known text, unless numbered lines are asked for.
+                asked = body["contents"][0]["parts"][1]["text"]
+                if "running number" in asked:
+                    numbered = f"ROTATION: 0\n1| FAKE-OCR request {number}\n2| second line | with a bar"
+                    self._json(
+                        200,
+                        {"candidates": [{"content": {"parts": [{"text": numbered}]}, "finishReason": "STOP"}]},
+                    )
+                else:
+                    self._json(200, {"candidates": [{"content": {"parts": []}, "finishReason": "RECITATION"}]})
             elif state["mode"] == "empty":
                 self._json(200, {"candidates": []})
             elif state["mode"] == "garbage":
