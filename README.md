@@ -30,7 +30,7 @@ Status: early. Written for and tested with Paperless-ngx 3.4.2.
 - A page the model calls empty is not taken on its word. If the page has a
   text layer of its own, the page counts as failed and keeps that text.
   Otherwise Tesseract takes a quick look at a small rendering of the page
-  (well under a second for an empty page): if it sees text, or could not
+  (about a second per page): if it sees text, or could not
   look, the page counts as failed too, gets proper local OCR text, and the
   document is tagged. Scanner specks on a blank page are not taken for text.
   The look uses the OCR languages of the installation, so it cannot vouch
@@ -141,6 +141,17 @@ an image with more than 120 megapixels or a TIFF with more than 2000 frames
 is imported with local OCR only and tagged, and a PDF page whose content
 needs unusual effort to analyse is rendered instead of being taken apart.
 
+The Gemini API refuses a page now and then, for example a handwritten page
+with ID numbers (`blockReason: OTHER`). That is final for the page: Tesseract
+reads it and the document is tagged.
+
+## Speed and cost
+
+Measured on a small VPS with `gemini-3.8-flash`: a single scanned page takes
+3 to 6 seconds, and the pages of a document are read side by side, so a
+six-page scan took 11 seconds. A page used about 1,650 input tokens and 200
+to 1,100 output tokens, depending on how much text is on it.
+
 ## Development
 
 ```bash
@@ -148,7 +159,8 @@ uv venv && uv pip install -e ".[test]"
 .venv/bin/python -m pytest
 ```
 
-The unit tests need `pdftotext` and `pdftoppm` (poppler). They run against
+The unit tests need `pdftotext` and `pdftoppm` (poppler); a few also use
+`tesseract` and are skipped without it. They run against
 stand-ins for the Paperless modules; `integration/` holds the tests against a
 real Paperless-ngx container.
 
